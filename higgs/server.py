@@ -1,0 +1,200 @@
+from fastapi import FastAPI, HTTPException, Body
+from fastapi.responses import Response, StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+import torch
+import time
+import io
+import sys
+import torch
+import torchaudio
+import soundfile as sf
+from fastapi import FastAPI, Response, HTTPException
+sys.path.append("/workspace/exp/higgs-audio")
+
+import numpy as np
+from boson_multimodal.serve.serve_engine import HiggsAudioServeEngine, HiggsAudioResponse
+from boson_multimodal.data_types import ChatMLSample, Message, AudioContent
+from boson_multimodal.model.higgs_audio.utils import revert_delay_pattern
+
+app = FastAPI()
+
+# Enable CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Configuration
+MODEL_PATH = "bosonai/higgs-audio-v2-generation-3B-base"
+AUDIO_TOKENIZER_PATH = "bosonai/higgs-audio-v2-tokenizer"
+# Force GPU 0 if available, else CPU (though Higgs needs GPU)
+DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
+SAMPLE_RATE = 16000
+
+def create_wav_chunk(audio_data: np.ndarray, sample_rate: int) -> bytes:
+    buffer = io.BytesIO()
+    # Safe clipping to avoid distortion
+    audio_clipped = np.clip(audio_data, -1.0, 1.0)
+    audio_int16 = (audio_clipped * 32767).astype(np.int16)
+    sf.write(buffer, audio_int16, sample_rate, format='WAV')
+    return buffer.getvalue()
+
+print(f"Loading model on {DEVICE}...")
+try:
+    serve_engine = HiggsAudioServeEngine(MODEL_PATH, AUDIO_TOKENIZER_PATH, device=DEVICE)
+    print("Model loaded successfully.")
+except Exception as e:
+    print(f"Error loading model: {e}")
+    # We don't exit here so the container stays alive for debugging if needed, but the endpoint will fail
+    serve_engine = None
+
+class GenerateRequest(BaseModel):
+    text: str
+    temperature: float = 0.4
+    top_p: float = 0.95
+    max_new_tokens: int = 1024
+
+@app.get("/health")
+def health():
+    if serve_engine is None:
+        raise HTTPException(status_code=503, detail="Model not loaded")
+    return {"status": "ok", "device": DEVICE}
+
+@app.post("/generate")
+def generate_audio(req: GenerateRequest):
+    start_time = time.time()
+    if serve_engine is None:
+        raise HTTPException(status_code=503, detail="Model not loaded")
+
+    system_prompt = (
+        "Generate audio following instruction. The speaker is a professional male with a standard US English accent. The voice is natural, clear, and articulated, speaking at a helpful and natural pace.\n\n"
+        "<|scene_desc_start|>\nAudio is recorded from a quiet room.\n<|scene_desc_end|>"
+    )
+
+    # Reference turn to lock voice (professional male)
+    ref_audio_path = "/workspace/exp/higgs-audio/examples/voice_prompts/en_man.wav"
+    ref_text_path = "/workspace/exp/higgs-audio/examples/voice_prompts/en_man.txt"
+    try:
+        with open(ref_text_path, "r", encoding="utf-8") as f:
+            ref_text = f.read().strip()
+    except Exception as e:
+        print(f"Error reading ref text: {e}")
+        ref_text = "The sun rises in the east and sets in the west."
+
+    messages = [
+        Message(role="system", content=system_prompt),
+        Message(role="user", content=ref_text),
+        Message(role="assistant", content=AudioContent(audio_url=ref_audio_path)),
+        Message(role="user", content=req.text),
+    ]
+
+    try:
+        output: HiggsAudioResponse = serve_engine.generate(
+            chat_ml_sample=ChatMLSample(messages=messages),
+            max_new_tokens=req.max_new_tokens,
+            temperature=req.temperature,
+            top_p=req.top_p,
+            top_k=50,
+            stop_strings=["<|end_of_text|>", "<|eot_id|>"],
+        )
+        
+        # Save to buffer
+        buffer = io.BytesIO()
+        # Use soundfile directly to avoid torchaudio/torchcodec issues
+        # output.audio might be a tensor or numpy array
+        audio_data = output.audio
+        if isinstance(audio_data, torch.Tensor):
+            audio_data = audio_data.float().cpu().numpy()
+            
+        if audio_data.ndim > 1:
+            audio_data = audio_data.flatten()
+            
+        sf.write(buffer, audio_data, output.sampling_rate, format='WAV')
+        buffer.seek(0)
+        
+        total_time = time.time() - start_time
+        print(f"DEBUG: Higgs generation took {total_time:.3f}s for '{req.text}'")
+        
+        return Response(content=buffer.read(), media_type="audio/wav")
+    except Exception as e:
+        print(f"Generation error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+@app.post("/generate_stream")
+async def generate_audio_stream(req: GenerateRequest):
+    if serve_engine is None:
+        raise HTTPException(status_code=503, detail="Model not loaded")
+
+    system_prompt = (
+        "Generate audio following instruction. The speaker is a professional male with a standard US English accent. The voice is natural, clear, and articulated, speaking at a helpful and natural pace.\n\n"
+        "<|scene_desc_start|>\nAudio is recorded from a quiet room.\n<|scene_desc_end|>"
+    )
+
+    ref_audio_path = "/workspace/exp/higgs-audio/examples/voice_prompts/en_man.wav"
+    ref_text_path = "/workspace/exp/higgs-audio/examples/voice_prompts/en_man.txt"
+    try:
+        with open(ref_text_path, "r", encoding="utf-8") as f:
+            ref_text = f.read().strip()
+    except Exception:
+        ref_text = "The sun rises in the east and sets in the west."
+
+    messages = [
+        Message(role="system", content=system_prompt),
+        Message(role="user", content=ref_text),
+        Message(role="assistant", content=AudioContent(audio_url=ref_audio_path)),
+        Message(role="user", content=req.text),
+    ]
+
+    async def audio_generator():
+        all_audio_tokens = []
+        yielded_samples = 0
+        is_first_chunk = True
+        num_codebooks = serve_engine.model.config.audio_num_codebooks
+        
+        async for delta in serve_engine.generate_delta_stream(
+            chat_ml_sample=ChatMLSample(messages=messages),
+            max_new_tokens=req.max_new_tokens,
+            temperature=req.temperature,
+            top_p=req.top_p,
+            top_k=50,
+        ):
+            if delta.audio_tokens is not None:
+                all_audio_tokens.append(delta.audio_tokens.cpu())
+                
+                # Buffer enough context for delay pattern reversal
+                if len(all_audio_tokens) >= num_codebooks + 20:
+                    tokens_tensor = torch.stack(all_audio_tokens, dim=1)
+                    reverted = revert_delay_pattern(tokens_tensor)
+                    
+                    # Trimming logic consistent with serve_engine.py: [:, 1:-1]
+                    # We skip the very first sample (index 0) of the whole stream
+                    start_idx = max(yielded_samples, 1)
+                    # Everything up to -(num_codebooks-1) is stable in the delay pattern sense
+                    # But we also subtract 1 to leave room for the final [:-1] trim
+                    end_idx = reverted.shape[1] - (num_codebooks - 1) - 1
+                    
+                    if end_idx > start_idx:
+                        stable_frames = reverted[:, start_idx : end_idx]
+                        vq_code = stable_frames.clip(0, serve_engine.audio_codebook_size - 1)
+                        wv_numpy = serve_engine.audio_tokenizer.decode(vq_code.unsqueeze(0).to(DEVICE))[0, 0]
+                        yield create_wav_chunk(wv_numpy, SAMPLE_RATE)
+                        yielded_samples = end_idx
+
+        # Flush remaining tokens
+        if len(all_audio_tokens) >= num_codebooks:
+            tokens_tensor = torch.stack(all_audio_tokens, dim=1)
+            reverted = revert_delay_pattern(tokens_tensor)
+            
+            # Final trim: take everything from yielded_samples up to (but not including) the last token
+            start_idx = max(yielded_samples, 1)
+            end_idx = reverted.shape[1] - 1 # This is the :-1 trimming for the end of sequence
+            
+            if end_idx > start_idx:
+                vq_code = reverted[:, start_idx : end_idx].clip(0, serve_engine.audio_codebook_size - 1)
+                wv_numpy = serve_engine.audio_tokenizer.decode(vq_code.unsqueeze(0).to(DEVICE))[0, 0]
+                yield create_wav_chunk(wv_numpy, SAMPLE_RATE)
+
+    return StreamingResponse(audio_generator(), media_type="application/octet-stream")

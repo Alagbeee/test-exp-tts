@@ -1,0 +1,218 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Real-time S2S Demo</title>
+    <style>
+        body {
+            font-family: sans-serif;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            height: 100vh;
+            background: #111;
+            color: #eee;
+        }
+
+        #status {
+            margin-top: 20px;
+            font-size: 1.2em;
+            color: #aaa;
+        }
+
+        button {
+            padding: 15px 30px;
+            font-size: 1.2em;
+            cursor: pointer;
+            background: #007bff;
+            color: white;
+            border: none;
+            border-radius: 5px;
+        }
+
+        button.recording {
+            background: #dc3545;
+        }
+
+        #log {
+            margin-top: 20px;
+            max-height: 200px;
+            overflow-y: auto;
+            width: 80%;
+            border: 1px solid #333;
+            padding: 10px;
+            font-family: monospace;
+            font-size: 0.9em;
+        }
+    </style>
+</head>
+
+<body>
+    <h1>⚡ Real-time Speech-to-Speech</h1>
+    <button id="toggleBtn">Start Interaction</button>
+    <div id="status">Disconnected</div>
+    <div id="log"></div>
+
+    <script>
+        const toggleBtn = document.getElementById('toggleBtn');
+        const statusDiv = document.getElementById('status');
+        const logDiv = document.getElementById('log');
+
+        let ws = null;
+        let audioContext = null;
+        let processor = null;
+        let microphone = null;
+        let isRecording = false;
+        let activeSources = new Set();
+
+        const WS_URL = (window.location.protocol === 'https:' ? 'wss://' : 'ws://') + window.location.host + '/ws';
+        // Override for local dev if needed, but Cloudflare tunnel handles ws:// usually
+        // If accessed via tunnel, protocol is https, so wss is correct.
+        // However, the tunnel endpoint forwards to HTTP/WS on localhost.
+
+        function log(msg) {
+            const div = document.createElement('div');
+            div.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
+            logDiv.prepend(div);
+        }
+
+        async function startAudio() {
+            try {
+                audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+                const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                microphone = audioContext.createMediaStreamSource(stream);
+
+                // Buffer size 4096, 1 channel input, 1 channel output
+                processor = audioContext.createScriptProcessor(4096, 1, 1);
+
+                processor.onaudioprocess = (e) => {
+                    if (!isRecording || !ws || ws.readyState !== WebSocket.OPEN) return;
+
+                    const inputData = e.inputBuffer.getChannelData(0);
+                    // Convert Float32 to Int16
+                    const buffer = new ArrayBuffer(inputData.length * 2);
+                    const view = new DataView(buffer);
+                    for (let i = 0; i < inputData.length; i++) {
+                        let s = Math.max(-1, Math.min(1, inputData[i]));
+                        view.setInt16(i * 2, s < 0 ? s * 0x8000 : s * 0x7FFF, true); // little-endian
+                    }
+                    ws.send(buffer);
+                };
+
+                microphone.connect(processor);
+                processor.connect(audioContext.destination);
+
+                isRecording = true;
+                toggleBtn.textContent = "Stop Interaction";
+                toggleBtn.classList.add("recording");
+                log("Microphone started");
+
+            } catch (err) {
+                log("Error accessing microphone: " + err);
+            }
+        }
+
+        function stopAudio() {
+            isRecording = false;
+            if (microphone) microphone.disconnect();
+            if (processor) processor.disconnect();
+            if (audioContext) audioContext.close();
+            toggleBtn.textContent = "Start Interaction";
+            toggleBtn.classList.remove("recording");
+        }
+
+        function connectWS() {
+            // If running via Cloudflare, we need to ensure we hit the right path
+            // Our start_services.sh will map /ws to the python server
+            // But wait, if we use a relative path '/ws', it goes to port 80 (Cloudflare) -> Frontend (8081).
+            // The frontend is just serving static files. It doesn't proxy WS by default unless we configured it.
+            // My plan said: "Route Cloudflare tunnel to 8082" OR "Add s2s_server.py to launch sequence".
+            // If I map the tunnel to 8082, then *everything* goes to 8082.
+            // s2s_server is FastAPI. It can serve the static frontend too!
+
+            // Correction: I should serve this index.html FROM the s2s_server.py!
+            // That way / matches index.html and /ws matches the websocket.
+            // I will update s2s_server.py next to serve static files.
+
+            ws = new WebSocket(WS_URL);
+            ws.binaryType = 'arraybuffer';
+
+            ws.onopen = () => {
+                statusDiv.textContent = "Connected";
+                log("WebSocket connected");
+                startAudio();
+            };
+
+            ws.onmessage = (event) => {
+                const data = event.data;
+                if (typeof data === 'string') {
+                    const msg = JSON.parse(data);
+                    statusDiv.textContent = msg.state.toUpperCase() + (msg.message ? ": " + msg.message : "");
+                    if (msg.text) log("ASR: " + msg.text);
+
+                    if (msg.state === 'interrupted') {
+                        log("Interrupted! Stopping playback.");
+                        activeSources.forEach(s => {
+                            try { s.stop(0); } catch (e) { }
+                        });
+                        activeSources.clear();
+                        nextStartTime = 0;
+                    }
+                } else if (data instanceof ArrayBuffer) {
+                    // Audio received
+                    log(`Received Audio (${data.byteLength} bytes)`);
+                    playAudio(data);
+                }
+            };
+
+            ws.onclose = () => {
+                statusDiv.textContent = "Disconnected";
+                log("WebSocket disconnected");
+                stopAudio();
+            };
+
+            ws.onerror = (err) => {
+                log("WebSocket Error");
+                console.error(err);
+            };
+        }
+
+        let nextStartTime = 0;
+
+        function playAudio(arrayBuffer) {
+            if (!audioContext) return;
+
+            audioContext.decodeAudioData(arrayBuffer, (buffer) => {
+                const source = audioContext.createBufferSource();
+                source.buffer = buffer;
+                source.connect(audioContext.destination);
+
+                // Track source for interruption
+                activeSources.add(source);
+                source.onended = () => activeSources.delete(source);
+
+                // Calculate when to start this chunk
+                const now = audioContext.currentTime;
+                if (nextStartTime < now) {
+                    nextStartTime = now + 0.1; // Small buffer for first chunk
+                }
+
+                source.start(nextStartTime);
+                nextStartTime += buffer.duration;
+            }, (err) => log("Error decoding audio: " + err));
+        }
+
+        toggleBtn.addEventListener('click', () => {
+            if (isRecording) {
+                if (ws) ws.close();
+            } else {
+                connectWS();
+            }
+        });
+    </script>
+</body>
+
+</html>

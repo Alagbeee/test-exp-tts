@@ -1,0 +1,51 @@
+services:
+  higgs-service:
+    build:
+      context: .
+      dockerfile: higgs/Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      - HF_TOKEN=${HF_TOKEN}
+    volumes:
+      - ./higgs-audio:/workspace/higgs-audio
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  canary-service:
+    build:
+      context: .
+      dockerfile: canary/Dockerfile
+    ports:
+      - "8001:8001"
+    environment:
+      - NGC_API_KEY=${NGC_API_KEY}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  frontend:
+    image: nginx:alpine
+    ports:
+      - "8080:80"
+    volumes:
+      - ./frontend/index.html:/usr/share/nginx/html/index.html
+      - ./frontend/nginx.conf:/etc/nginx/nginx.conf
+    depends_on:
+      - higgs-service
+      - canary-service
+
+  tunnel:
+    image: cloudflare/cloudflared:latest
+    command: tunnel --url http://frontend:80
+    depends_on:
+      - frontend

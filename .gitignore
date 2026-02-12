@@ -1,0 +1,10 @@
+venv_canary/
+venv_higgs/
+higgs-audio/
+*.log
+*.wav
+cloudflared
+__pycache__/
+.gemini/
+.agent/
+brain/
