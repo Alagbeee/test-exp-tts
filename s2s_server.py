@@ -13,7 +13,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from starlette.websockets import WebSocketState
 
 # Configure logging
-logging.basicConfig(level=logging.DEBUG)
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("S2S-Orchestrator")
 
 app = FastAPI()
@@ -45,8 +45,8 @@ GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_MODEL = "llama-3.1-8b-instant"
 
 SAMPLE_RATE = 16000
-VAD_THRESHOLD = 3000 # Higher threshold to ignore background noise
-SILENCE_DURATION = 1.2  # Safer turnaround time
+VAD_THRESHOLD = 1500 # Very safe threshold to avoid self-triggering loops
+SILENCE_DURATION = 0.7  # Seconds of silence to trigger processing
 MIN_AUDIO_DURATION = 0.5 # Minimum audio duration to process
 
 class ConnectionManager:
@@ -130,25 +130,16 @@ async def call_groq_stream(session, text):
 async def split_into_sentences(text_stream):
     """Helper to yield sentences/chunks from a stream of characters/words"""
     buffer = ""
+    # Sub-sentence and sentence splitting marks
     terminals = {'.', '!', '?', '\n', ',', ';', ':'}
-    is_first_chunk = True
     
     async for chunk in text_stream:
         for char in chunk:
             buffer += char
-            
-            # Micro-chunking: For the very first chunk, yield even earlier
-            if is_first_chunk:
-                # If we have 20 chars or a terminal, yield it
-                if (char in terminals or len(buffer.strip()) > 30) and len(buffer.strip()) > 5:
-                    yield buffer.strip()
-                    buffer = ""
-                    is_first_chunk = False
-            else:
-                # Normal sentence splitting
-                if char in terminals and len(buffer.strip()) > 15:
-                    yield buffer.strip()
-                    buffer = ""
+            # Check if we have a chunk (15 chars is ~3-4 words)
+            if char in terminals and len(buffer.strip()) > 15:
+                yield buffer.strip()
+                buffer = ""
     
     if buffer.strip():
         yield buffer.strip()
@@ -266,8 +257,6 @@ async def websocket_endpoint(websocket: WebSocket):
     silence_start = None
     is_speaking = False
     current_task = None
-    high_energy_count = 0
-    REQUIRED_CONTINUITY = 3 # Consecutive frames to confirm speech
     
     try:
         while True:
@@ -282,38 +271,24 @@ async def websocket_endpoint(websocket: WebSocket):
             # Calculate RMS amplitude
             energy = np.sqrt(np.mean(chunk_np.astype(float)**2))
             
-            # Debug energy frequently
-            if int(time.time() * 20) % 20 == 0:
-                 logger.debug(f"Energy: {energy:.1f} | Speaking: {is_speaking} | Continuity: {high_energy_count}")
-
             if energy > VAD_THRESHOLD:
-                high_energy_count += 1
-                
-                # Check for interruption or speech start
-                if high_energy_count >= REQUIRED_CONTINUITY:
-                    if not is_speaking:
-                        is_speaking = True
-                        logger.info(f"Speech detected (Continuity: {high_energy_count})")
-                        # Interruption: Cancel existing task and notify client
-                        if current_task and not current_task.done():
-                            current_task.cancel()
-                            logger.info("Interrupted current task")
-                            await safe_send_text(websocket, {"state": "interrupted"})
-                        
-                        await safe_send_text(websocket, {"state": "listening", "message": "Listening..."})
+                if not is_speaking:
+                    is_speaking = True
+                    logger.info("Speech detected")
+                    # Interruption: Cancel existing task and notify client
+                    if current_task and not current_task.done():
+                        current_task.cancel()
+                        logger.info("Interrupted current task")
+                        await safe_send_text(websocket, {"state": "interrupted"})
                     
-                    # Reset silence timer
-                    silence_start = None
-                    audio_buffer.extend(data)
-                else:
-                    # Still gathering evidence for speech
-                    if is_speaking:
-                        audio_buffer.extend(data)
+                    await safe_send_text(websocket, {"state": "listening", "message": "Listening..."})
+                
+                # Reset silence timer
+                silence_start = None
+                audio_buffer.extend(data)
                 
             else:
-                # Low energy frame
-                high_energy_count = 0
-                
+                # Silence frame
                 if is_speaking:
                     # Append silence if we are in "speaking" mode to catch trailing words
                     audio_buffer.extend(data)
