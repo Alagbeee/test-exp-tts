@@ -148,6 +148,14 @@
                 statusDiv.textContent = "Connected";
                 log("WebSocket connected");
                 startAudio();
+
+                // Keep-alive heartbeat
+                if (window.heartbeatInterval) clearInterval(window.heartbeatInterval);
+                window.heartbeatInterval = setInterval(() => {
+                    if (ws.readyState === WebSocket.OPEN) {
+                        ws.send(JSON.stringify({ type: "ping" }));
+                    }
+                }, 10000);
             };
 
             ws.onmessage = (event) => {
@@ -183,9 +191,10 @@
                 }
             };
 
-            ws.onclose = () => {
+            ws.onclose = (event) => {
                 statusDiv.textContent = "Disconnected";
-                log("WebSocket disconnected");
+                log(`WebSocket disconnected (Code: ${event.code}${event.reason ? ", Reason: " + event.reason : ""})`);
+                if (window.heartbeatInterval) clearInterval(window.heartbeatInterval);
                 stopAudio();
             };
 

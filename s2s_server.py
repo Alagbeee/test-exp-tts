@@ -51,18 +51,28 @@ MIN_AUDIO_DURATION = 0.5 # Minimum audio duration to process
 
 class ConnectionManager:
     def __init__(self):
-        self.active_connections: list[WebSocket] = []
-        self.send_lock = asyncio.Lock()
+        # Map websocket to its own Lock
+        self.locks: dict[WebSocket, asyncio.Lock] = {}
 
     async def connect(self, websocket: WebSocket):
         await websocket.accept()
-        self.active_connections.append(websocket)
+        self.locks[websocket] = asyncio.Lock()
 
     def disconnect(self, websocket: WebSocket):
-        if websocket in self.active_connections:
-            self.active_connections.remove(websocket)
+        if websocket in self.locks:
+            del self.locks[websocket]
+
+    def get_lock(self, websocket: WebSocket):
+        return self.locks.get(websocket)
 
 manager = ConnectionManager()
+_global_session = None
+
+async def get_session():
+    global _global_session
+    if _global_session is None or _global_session.closed:
+        _global_session = aiohttp.ClientSession()
+    return _global_session
 
 def create_wav_buffer(audio_data: bytes) -> io.BytesIO:
     buffer = io.BytesIO()
@@ -77,16 +87,20 @@ def create_wav_buffer(audio_data: bytes) -> io.BytesIO:
 async def safe_send_text(websocket: WebSocket, msg_dict: dict):
     try:
         if websocket.client_state == WebSocketState.CONNECTED:
-            async with manager.send_lock:
-                await websocket.send_text(json.dumps(msg_dict))
+            lock = manager.get_lock(websocket)
+            if lock:
+                async with lock:
+                    await websocket.send_text(json.dumps(msg_dict))
     except Exception as e:
         logger.error(f"Error sending text: {e}")
 
 async def safe_send_bytes(websocket: WebSocket, data: bytes):
     try:
         if websocket.client_state == WebSocketState.CONNECTED:
-            async with manager.send_lock:
-                await websocket.send_bytes(data)
+            lock = manager.get_lock(websocket)
+            if lock:
+                async with lock:
+                    await websocket.send_bytes(data)
     except Exception as e:
         logger.error(f"Error sending bytes: {e}")
 
@@ -164,15 +178,15 @@ async def process_audio(audio_buffer: bytes, websocket: WebSocket):
     
     await safe_send_text(websocket, {"state": "processing", "message": "Transcribing..."})
 
-    async with aiohttp.ClientSession() as session:
-        # 1. ASR - Canary
-        text = ""
-        try:
-            wav_buffer = create_wav_buffer(audio_buffer)
-            data = aiohttp.FormData()
-            data.add_field('file', wav_buffer, filename='input.wav', content_type='audio/wav')
-            
-            async with session.post(CANARY_URL, data=data, timeout=15) as resp:
+    session = await get_session()
+    # 1. ASR - Canary
+    text = ""
+    try:
+        wav_buffer = create_wav_buffer(audio_buffer)
+        data = aiohttp.FormData()
+        data.add_field('file', wav_buffer, filename='input.wav', content_type='audio/wav')
+        
+        async with session.post(CANARY_URL, data=data, timeout=15) as resp:
                 if resp.status != 200:
                     await safe_send_text(websocket, {"state": "error", "message": f"ASR Error: {resp.status}"})
                     return
@@ -263,7 +277,22 @@ async def websocket_endpoint(websocket: WebSocket):
     
     try:
         while True:
-            data = await websocket.receive_bytes()
+            # We use receive() instead of receive_bytes() to handle text (heartbeats) too
+            message = await websocket.receive()
+            
+            if "bytes" in message:
+                data = message["bytes"]
+            elif "text" in message:
+                try:
+                    text_data = json.loads(message["text"])
+                    if text_data.get("type") == "ping":
+                        # Heartbeat, ignore
+                        continue
+                except:
+                    pass
+                continue
+            else:
+                continue
             
             # Simple VAD (Energy based)
             # 16-bit PCM, 16kHz
