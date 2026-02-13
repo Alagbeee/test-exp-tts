@@ -278,7 +278,11 @@ async def websocket_endpoint(websocket: WebSocket):
     try:
         while True:
             # We use receive() instead of receive_bytes() to handle text (heartbeats) too
-            message = await websocket.receive()
+            try:
+                message = await websocket.receive()
+            except Exception as e:
+                logger.error(f"WebSocket receive error: {e}")
+                break
             
             if "bytes" in message:
                 data = message["bytes"]
@@ -292,6 +296,10 @@ async def websocket_endpoint(websocket: WebSocket):
                     pass
                 continue
             else:
+                # This includes 'websocket.disconnect' types
+                if message.get("type") == "websocket.disconnect":
+                    logger.info("WebSocket disconnect message received")
+                    break
                 continue
             
             # Simple VAD (Energy based)
@@ -338,6 +346,7 @@ async def websocket_endpoint(websocket: WebSocket):
                                 audio_buffer = bytearray()
                                 
                                 # Start as background task
+                                # Note: We don't wait for it here
                                 current_task = asyncio.create_task(process_audio(current_buffer, websocket))
                             
                             silence_start = None
@@ -346,11 +355,14 @@ async def websocket_endpoint(websocket: WebSocket):
                     pass
 
     except WebSocketDisconnect:
-        manager.disconnect(websocket)
-        logger.info("Client disconnected")
+        logger.info("Client disconnected naturally")
     except Exception as e:
-        logger.error(f"WebSocket error: {e}")
-        # manager.disconnect(websocket)
+        logger.error(f"WebSocket session error: {e}")
+    finally:
+        manager.disconnect(websocket)
+        if current_task and not current_task.done():
+            current_task.cancel()
+        logger.info("Cleaned up WebSocket connection")
 
 @app.get("/health")
 def health():
