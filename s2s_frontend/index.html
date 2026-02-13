@@ -54,11 +54,13 @@
     <h1>⚡ Real-time Speech-to-Speech</h1>
     <button id="toggleBtn">Start Interaction</button>
     <div id="status">Disconnected</div>
+    <div id="latency" style="margin-top: 10px; font-weight: bold; color: #00ffcc;"></div>
     <div id="log"></div>
 
     <script>
         const toggleBtn = document.getElementById('toggleBtn');
         const statusDiv = document.getElementById('status');
+        const latencyDiv = document.getElementById('latency');
         const logDiv = document.getElementById('log');
 
         let ws = null;
@@ -67,6 +69,8 @@
         let microphone = null;
         let isRecording = false;
         let activeSources = new Set();
+        let startThinkingTime = 0;
+        let firstAudioReceived = false;
 
         const WS_URL = (window.location.protocol === 'https:' ? 'wss://' : 'ws://') + window.location.host + '/ws';
         // Override for local dev if needed, but Cloudflare tunnel handles ws:// usually
@@ -153,6 +157,12 @@
                     statusDiv.textContent = msg.state.toUpperCase() + (msg.message ? ": " + msg.message : "");
                     if (msg.text) log("ASR: " + msg.text);
 
+                    if (msg.state === 'processing') {
+                        startThinkingTime = performance.now();
+                        firstAudioReceived = false;
+                        latencyDiv.textContent = "Measuring latency...";
+                    }
+
                     if (msg.state === 'interrupted') {
                         log("Interrupted! Stopping playback.");
                         activeSources.forEach(s => {
@@ -162,6 +172,11 @@
                         nextStartTime = 0;
                     }
                 } else if (data instanceof ArrayBuffer) {
+                    if (!firstAudioReceived && startThinkingTime > 0) {
+                        const latency = performance.now() - startThinkingTime;
+                        latencyDiv.textContent = `Latency (End-to-End): ${Math.round(latency)}ms`;
+                        firstAudioReceived = true;
+                    }
                     // Audio received
                     log(`Received Audio (${data.byteLength} bytes)`);
                     playAudio(data);

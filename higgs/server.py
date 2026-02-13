@@ -54,9 +54,10 @@ except Exception as e:
 
 class GenerateRequest(BaseModel):
     text: str
-    temperature: float = 0.8
+    temperature: float = 0.5
     top_p: float = 0.95
     max_new_tokens: int = 1024
+    seed: int = 42
 
 @app.get("/health")
 def health():
@@ -71,7 +72,7 @@ def generate_audio(req: GenerateRequest):
         raise HTTPException(status_code=503, detail="Model not loaded")
 
     system_prompt = (
-        "Generate audio following instruction.\n\n"
+        "Generate audio. Use a steady, consistent, and calm professional male voice. Maintain the same pitch and emotional tone throughout.\n\n"
         "<|scene_desc_start|>\nAudio is recorded from a quiet room.\n<|scene_desc_end|>"
     )
 
@@ -99,6 +100,7 @@ def generate_audio(req: GenerateRequest):
             temperature=req.temperature,
             top_p=req.top_p,
             top_k=50,
+            seed=req.seed,
             stop_strings=["<|end_of_text|>", "<|eot_id|>"],
         )
         
@@ -129,7 +131,7 @@ async def generate_audio_stream(req: GenerateRequest):
         raise HTTPException(status_code=503, detail="Model not loaded")
 
     system_prompt = (
-        "Generate audio following instruction.\n\n"
+        "Generate audio. Use a steady, consistent, and calm professional male voice. Maintain the same pitch and emotional tone throughout.\n\n"
         "<|scene_desc_start|>\nAudio is recorded from a quiet room.\n<|scene_desc_end|>"
     )
 
@@ -167,6 +169,7 @@ async def generate_audio_stream(req: GenerateRequest):
             temperature=req.temperature,
             top_p=req.top_p,
             top_k=50,
+            seed=req.seed,
         ):
             if delta.audio_tokens is not None:
                 all_audio_tokens.append(delta.audio_tokens.cpu())
