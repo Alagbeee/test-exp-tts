@@ -163,7 +163,19 @@
                 if (typeof data === 'string') {
                     const msg = JSON.parse(data);
                     statusDiv.textContent = msg.state.toUpperCase() + (msg.message ? ": " + msg.message : "");
-                    if (msg.text) log("ASR: " + msg.text);
+
+                    if (msg.state === 'listening' && msg.message === 'Listening...') {
+                        log("👂 Speech detected...");
+                    }
+
+                    if (msg.text) {
+                        if (msg.state === 'transcribed') {
+                            log("👤 User: " + msg.text);
+                        } else if (msg.state === 'thinking') {
+                            // Thinking state often contains partial or full LLM response
+                            log("🤖 Assistant: " + msg.text);
+                        }
+                    }
 
                     if (msg.state === 'processing') {
                         startThinkingTime = performance.now();
@@ -172,7 +184,7 @@
                     }
 
                     if (msg.state === 'interrupted') {
-                        log("Interrupted! Stopping playback.");
+                        log("🛑 Assistant Interrupted!");
                         activeSources.forEach(s => {
                             try { s.stop(0); } catch (e) { }
                         });
