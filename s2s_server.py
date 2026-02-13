@@ -42,11 +42,11 @@ HIGGS_URL = "http://localhost:8000/generate_stream"
 # Groq Configuration
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
-GROQ_MODEL = "llama-3.3-70b-versatile"
+GROQ_MODEL = "llama-3-8b-8192"
 
 SAMPLE_RATE = 16000
 VAD_THRESHOLD = 1500 # Very safe threshold to avoid self-triggering loops
-SILENCE_DURATION = 1.0  # Seconds of silence to trigger processing
+SILENCE_DURATION = 0.7  # Seconds of silence to trigger processing (Reduced for latency)
 MIN_AUDIO_DURATION = 0.5 # Minimum audio duration to process
 
 class ConnectionManager:
@@ -130,16 +130,25 @@ async def call_groq_stream(session, text):
 async def split_into_sentences(text_stream):
     """Helper to yield sentences/chunks from a stream of characters/words"""
     buffer = ""
-    # Sub-sentence and sentence splitting marks
     terminals = {'.', '!', '?', '\n', ',', ';', ':'}
+    is_first_chunk = True
     
     async for chunk in text_stream:
         for char in chunk:
             buffer += char
-            # Check if we have a chunk (15 chars is ~3-4 words)
-            if char in terminals and len(buffer.strip()) > 15:
-                yield buffer.strip()
-                buffer = ""
+            
+            # Micro-chunking: For the very first chunk, yield even earlier
+            if is_first_chunk:
+                # If we have 20 chars or a terminal, yield it
+                if (char in terminals or len(buffer.strip()) > 30) and len(buffer.strip()) > 5:
+                    yield buffer.strip()
+                    buffer = ""
+                    is_first_chunk = False
+            else:
+                # Normal sentence splitting
+                if char in terminals and len(buffer.strip()) > 15:
+                    yield buffer.strip()
+                    buffer = ""
     
     if buffer.strip():
         yield buffer.strip()
