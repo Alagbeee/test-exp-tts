@@ -13,7 +13,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from starlette.websockets import WebSocketState
 
 # Configure logging
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger("S2S-Orchestrator")
 
 app = FastAPI()
@@ -45,8 +45,8 @@ GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_MODEL = "llama-3.1-8b-instant"
 
 SAMPLE_RATE = 16000
-VAD_THRESHOLD = 1500 # Very safe threshold to avoid self-triggering loops
-SILENCE_DURATION = 0.7  # Seconds of silence to trigger processing (Reduced for latency)
+VAD_THRESHOLD = 3000 # Higher threshold to ignore background noise
+SILENCE_DURATION = 1.2  # Safer turnaround time
 MIN_AUDIO_DURATION = 0.5 # Minimum audio duration to process
 
 class ConnectionManager:
@@ -266,6 +266,8 @@ async def websocket_endpoint(websocket: WebSocket):
     silence_start = None
     is_speaking = False
     current_task = None
+    high_energy_count = 0
+    REQUIRED_CONTINUITY = 3 # Consecutive frames to confirm speech
     
     try:
         while True:
@@ -280,24 +282,38 @@ async def websocket_endpoint(websocket: WebSocket):
             # Calculate RMS amplitude
             energy = np.sqrt(np.mean(chunk_np.astype(float)**2))
             
+            # Debug energy frequently
+            if int(time.time() * 20) % 20 == 0:
+                 logger.debug(f"Energy: {energy:.1f} | Speaking: {is_speaking} | Continuity: {high_energy_count}")
+
             if energy > VAD_THRESHOLD:
-                if not is_speaking:
-                    is_speaking = True
-                    logger.info("Speech detected")
-                    # Interruption: Cancel existing task and notify client
-                    if current_task and not current_task.done():
-                        current_task.cancel()
-                        logger.info("Interrupted current task")
-                        await safe_send_text(websocket, {"state": "interrupted"})
-                    
-                    await safe_send_text(websocket, {"state": "listening", "message": "Listening..."})
+                high_energy_count += 1
                 
-                # Reset silence timer
-                silence_start = None
-                audio_buffer.extend(data)
+                # Check for interruption or speech start
+                if high_energy_count >= REQUIRED_CONTINUITY:
+                    if not is_speaking:
+                        is_speaking = True
+                        logger.info(f"Speech detected (Continuity: {high_energy_count})")
+                        # Interruption: Cancel existing task and notify client
+                        if current_task and not current_task.done():
+                            current_task.cancel()
+                            logger.info("Interrupted current task")
+                            await safe_send_text(websocket, {"state": "interrupted"})
+                        
+                        await safe_send_text(websocket, {"state": "listening", "message": "Listening..."})
+                    
+                    # Reset silence timer
+                    silence_start = None
+                    audio_buffer.extend(data)
+                else:
+                    # Still gathering evidence for speech
+                    if is_speaking:
+                        audio_buffer.extend(data)
                 
             else:
-                # Silence frame
+                # Low energy frame
+                high_energy_count = 0
+                
                 if is_speaking:
                     # Append silence if we are in "speaking" mode to catch trailing words
                     audio_buffer.extend(data)
