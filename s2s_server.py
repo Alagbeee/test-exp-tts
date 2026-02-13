@@ -187,81 +187,81 @@ async def process_audio(audio_buffer: bytes, websocket: WebSocket):
         data.add_field('file', wav_buffer, filename='input.wav', content_type='audio/wav')
         
         async with session.post(CANARY_URL, data=data, timeout=15) as resp:
-                if resp.status != 200:
-                    await safe_send_text(websocket, {"state": "error", "message": f"ASR Error: {resp.status}"})
-                    return
-                result = await resp.json()
-                text = result.get("text", "").strip()
-                score = result.get("score", 0.0)
-                logger.info(f"Canary Transcript: '{text}' (Score: {score})")
+            if resp.status != 200:
+                await safe_send_text(websocket, {"state": "error", "message": f"ASR Error: {resp.status}"})
+                return
+            result = await resp.json()
+            text = result.get("text", "").strip()
+            score = result.get("score", 0.0)
+            logger.info(f"Canary Transcript: '{text}' (Score: {score})")
                 
-                # Confidence threshold check
-                # Canary scores are log-probs; 0.0 is perfect, lower is worse.
-                # A threshold of -1.0 is roughly "some uncertainty"
-                CONFIDENCE_THRESHOLD = -1.0 
+            # Confidence threshold check
+            # Canary scores are log-probs; 0.0 is perfect, lower is worse.
+            # A threshold of -1.0 is roughly "some uncertainty"
+            CONFIDENCE_THRESHOLD = -1.0 
                 
-                if score < CONFIDENCE_THRESHOLD and len(text.split()) > 2:
-                    logger.warning(f"Low ASR confidence ({score}). Triggering rephrase.")
-                    text = "I'm sorry, I didn't hear you clearly. Could you please repeat what you said?"
-                    # We skip Groq and go straight to TTS with this message
-                    await safe_send_text(websocket, {"state": "transcribed", "text": "[Low confidence] " + text})
-                    await safe_send_text(websocket, {"state": "processing", "message": "Asking to repeat..."})
-                    
-                    async with session.post(HIGGS_URL, json={"text": text}, timeout=aiohttp.ClientTimeout(total=30)) as tts_resp:
-                        if tts_resp.status == 200:
-                            async for chunk in tts_resp.content.iter_any():
-                                if chunk: await safe_send_bytes(websocket, chunk)
-                    
-                    await safe_send_text(websocket, {"state": "idle", "message": "Listening..."})
-                    return
-
-                # Filter short hallucinations
-                if not text or len(text) < 3 or text.lower() in ["problem.", "wow.", "wow", "oh."]:
-                    await safe_send_text(websocket, {"state": "idle", "message": "No speech detected."})
-                    return
-                await safe_send_text(websocket, {"state": "transcribed", "text": text})
-
-        except Exception as e:
-            logger.error(f"ASR Exception: {e}")
-            await safe_send_text(websocket, {"state": "error", "message": str(e)})
-            return
-
-        # 2 & 3. Streaming Intelligence + TTS
-        await safe_send_text(websocket, {"state": "processing", "message": "Thinking..."})
-        
-        full_response = ""
-        try:
-            # Iterate through sentences as they are generated
-            async for sentence in split_into_sentences(call_groq_stream(session, text)):
-                full_response += " " + sentence
-                logger.info(f"Sentence ready for TTS: {sentence}")
+            if score < CONFIDENCE_THRESHOLD and len(text.split()) > 2:
+                logger.warning(f"Low ASR confidence ({score}). Triggering rephrase.")
+                text = "I'm sorry, I didn't hear you clearly. Could you please repeat what you said?"
+                # We skip Groq and go straight to TTS with this message
+                await safe_send_text(websocket, {"state": "transcribed", "text": "[Low confidence] " + text})
+                await safe_send_text(websocket, {"state": "processing", "message": "Asking to repeat..."})
                 
-                # Notify client of partial text (Thinking...)
-                await safe_send_text(websocket, {"state": "thinking", "text": full_response.strip()})
+                async with session.post(HIGGS_URL, json={"text": text}, timeout=aiohttp.ClientTimeout(total=30)) as tts_resp:
+                    if tts_resp.status == 200:
+                        async for chunk in tts_resp.content.iter_any():
+                            if chunk: await safe_send_bytes(websocket, chunk)
                 
-                # Immediately call TTS for this sentence (streaming)
-                try:
-                    async with session.post(HIGGS_URL, json={"text": sentence}, timeout=aiohttp.ClientTimeout(total=30)) as resp:
-                        if resp.status == 200:
-                            # Stream the audio chunks from Higgs
-                            async for chunk in resp.content.iter_any():
-                                if chunk:
-                                    await safe_send_bytes(websocket, chunk)
-                            logger.info(f"Finished relaying Higgs stream for sentence: {sentence[:20]}...")
-                        else:
-                            logger.error(f"Higgs failed for sentence: {resp.status}")
-                except Exception as e:
-                    logger.error(f"TTS sentence exception: {e}")
+                await safe_send_text(websocket, {"state": "idle", "message": "Listening..."})
+                return
 
-            # After all sentences are done
-            await safe_send_text(websocket, {"state": "idle", "message": "Listening..."})
+            # Filter short hallucinations
+            if not text or len(text) < 3 or text.lower() in ["problem.", "wow.", "wow", "oh."]:
+                await safe_send_text(websocket, {"state": "idle", "message": "No speech detected."})
+                return
+            await safe_send_text(websocket, {"state": "transcribed", "text": text})
 
-        except asyncio.CancelledError:
-            logger.info("Process audio task cancelled (interrupted by user)")
-            raise
-        except Exception as e:
-            logger.error(f"Stream/TTS loop exception: {e}")
-            await safe_send_text(websocket, {"state": "error", "message": "Processing interrupted."})
+    except Exception as e:
+        logger.error(f"ASR Exception: {e}")
+        await safe_send_text(websocket, {"state": "error", "message": str(e)})
+        return
+
+    # 2 & 3. Streaming Intelligence + TTS
+    await safe_send_text(websocket, {"state": "processing", "message": "Thinking..."})
+    
+    full_response = ""
+    try:
+        # Iterate through sentences as they are generated
+        async for sentence in split_into_sentences(call_groq_stream(session, text)):
+            full_response += " " + sentence
+            logger.info(f"Sentence ready for TTS: {sentence}")
+            
+            # Notify client of partial text (Thinking...)
+            await safe_send_text(websocket, {"state": "thinking", "text": full_response.strip()})
+            
+            # Immediately call TTS for this sentence (streaming)
+            try:
+                async with session.post(HIGGS_URL, json={"text": sentence}, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                    if resp.status == 200:
+                        # Stream the audio chunks from Higgs
+                        async for chunk in resp.content.iter_any():
+                            if chunk:
+                                await safe_send_bytes(websocket, chunk)
+                        logger.info(f"Finished relaying Higgs stream for sentence: {sentence[:20]}...")
+                    else:
+                        logger.error(f"Higgs failed for sentence: {resp.status}")
+            except Exception as e:
+                logger.error(f"TTS sentence exception: {e}")
+
+        # After all sentences are done
+        await safe_send_text(websocket, {"state": "idle", "message": "Listening..."})
+
+    except asyncio.CancelledError:
+        logger.info("Process audio task cancelled (interrupted by user)")
+        raise
+    except Exception as e:
+        logger.error(f"Stream/TTS loop exception: {e}")
+        await safe_send_text(websocket, {"state": "error", "message": "Processing interrupted."})
 
 
 
