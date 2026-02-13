@@ -46,7 +46,7 @@ GROQ_MODEL = "llama-3.1-8b-instant"
 
 SAMPLE_RATE = 16000
 VAD_THRESHOLD = 1500 # Very safe threshold to avoid self-triggering loops
-SILENCE_DURATION = 0.7  # Seconds of silence to trigger processing
+SILENCE_DURATION = 0.4  # Seconds of silence to trigger processing
 MIN_AUDIO_DURATION = 0.5 # Minimum audio duration to process
 
 class ConnectionManager:
