@@ -33,7 +33,7 @@ MODEL_PATH = "bosonai/higgs-audio-v2-generation-3B-base"
 AUDIO_TOKENIZER_PATH = "bosonai/higgs-audio-v2-tokenizer"
 # Force GPU 0 if available, else CPU (though Higgs needs GPU)
 DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
-SAMPLE_RATE = 16000
+SAMPLE_RATE = 24000
 
 def create_wav_chunk(audio_data: np.ndarray, sample_rate: int) -> bytes:
     buffer = io.BytesIO()
@@ -54,7 +54,7 @@ except Exception as e:
 
 class GenerateRequest(BaseModel):
     text: str
-    temperature: float = 0.4
+    temperature: float = 0.8
     top_p: float = 0.95
     max_new_tokens: int = 1024
 
@@ -71,7 +71,7 @@ def generate_audio(req: GenerateRequest):
         raise HTTPException(status_code=503, detail="Model not loaded")
 
     system_prompt = (
-        "Generate audio following instruction. The speaker is a professional male with a standard US English accent. The voice is natural, clear, and articulated, speaking at a helpful and natural pace.\n\n"
+        "Generate audio following instruction.\n\n"
         "<|scene_desc_start|>\nAudio is recorded from a quiet room.\n<|scene_desc_end|>"
     )
 
@@ -129,7 +129,7 @@ async def generate_audio_stream(req: GenerateRequest):
         raise HTTPException(status_code=503, detail="Model not loaded")
 
     system_prompt = (
-        "Generate audio following instruction. The speaker is a professional male with a standard US English accent. The voice is natural, clear, and articulated, speaking at a helpful and natural pace.\n\n"
+        "Generate audio following instruction.\n\n"
         "<|scene_desc_start|>\nAudio is recorded from a quiet room.\n<|scene_desc_end|>"
     )
 
@@ -150,9 +150,16 @@ async def generate_audio_stream(req: GenerateRequest):
 
     async def audio_generator():
         all_audio_tokens = []
-        yielded_samples = 0
-        is_first_chunk = True
-        num_codebooks = serve_engine.model.config.audio_num_codebooks
+        yielded_tokens = 0
+        num_codebooks = serve_engine.audio_num_codebooks
+        tps = serve_engine.audio_tokenizer_tps
+        sr = serve_engine.audio_tokenizer.sampling_rate
+        samples_per_token = int(sr // tps)
+        
+        # Buffer for decoding context (to prevent edge artifacts)
+        DECODE_CONTEXT = 16 
+        # Chunk size to yield to client (buffer this many stable tokens)
+        CHUNK_TOKENS = 12 # ~160ms at 75 TPS
         
         async for delta in serve_engine.generate_delta_stream(
             chat_ml_sample=ChatMLSample(messages=messages),
@@ -164,37 +171,51 @@ async def generate_audio_stream(req: GenerateRequest):
             if delta.audio_tokens is not None:
                 all_audio_tokens.append(delta.audio_tokens.cpu())
                 
-                # Buffer enough context for delay pattern reversal
-                if len(all_audio_tokens) >= num_codebooks + 20:
+                # Check how many 'stable' tokens we have after delay pattern reversal
+                if len(all_audio_tokens) >= num_codebooks + CHUNK_TOKENS:
                     tokens_tensor = torch.stack(all_audio_tokens, dim=1)
                     reverted = revert_delay_pattern(tokens_tensor)
+                    current_reverted_len = reverted.shape[1]
                     
-                    # Trimming logic consistent with serve_engine.py: [:, 1:-1]
-                    # We skip the very first sample (index 0) of the whole stream
-                    start_idx = max(yielded_samples, 1)
-                    # Everything up to -(num_codebooks-1) is stable in the delay pattern sense
-                    # But we also subtract 1 to leave room for the final [:-1] trim
-                    end_idx = reverted.shape[1] - (num_codebooks - 1) - 1
+                    # We skip the very first token of the stream [:, 1:-1]
+                    start_token = max(yielded_tokens, 1)
+                    # We leave at least 1 token at the end for the final trim
+                    end_token = current_reverted_len - 1
                     
-                    if end_idx > start_idx:
-                        stable_frames = reverted[:, start_idx : end_idx]
-                        vq_code = stable_frames.clip(0, serve_engine.audio_codebook_size - 1)
-                        wv_numpy = serve_engine.audio_tokenizer.decode(vq_code.unsqueeze(0).to(DEVICE))[0, 0]
-                        yield create_wav_chunk(wv_numpy, SAMPLE_RATE)
-                        yielded_samples = end_idx
+                    if end_token - start_token >= CHUNK_TOKENS:
+                        # Decode with context history
+                        decode_start = max(0, start_token - DECODE_CONTEXT)
+                        vq_code = reverted[:, decode_start : end_token].clip(0, serve_engine.audio_codebook_size - 1)
+                        
+                        wv_full = serve_engine.audio_tokenizer.decode(vq_code.unsqueeze(0).to(DEVICE))[0, 0]
+                        
+                        # Extract the part we haven't yielded yet
+                        offset = (start_token - decode_start) * samples_per_token
+                        count = (end_token - start_token) * samples_per_token
+                        wv_chunk = wv_full[offset : offset + count]
+                        
+                        # Yield raw PCM int16
+                        audio_int16 = (np.clip(wv_chunk, -1.0, 1.0) * 32767).astype(np.int16)
+                        yield audio_int16.tobytes()
+                        yielded_tokens = end_token
 
         # Flush remaining tokens
         if len(all_audio_tokens) >= num_codebooks:
             tokens_tensor = torch.stack(all_audio_tokens, dim=1)
             reverted = revert_delay_pattern(tokens_tensor)
             
-            # Final trim: take everything from yielded_samples up to (but not including) the last token
-            start_idx = max(yielded_samples, 1)
-            end_idx = reverted.shape[1] - 1 # This is the :-1 trimming for the end of sequence
+            start_token = max(yielded_tokens, 1)
+            end_token = reverted.shape[1] - 1 # Final trim
             
-            if end_idx > start_idx:
-                vq_code = reverted[:, start_idx : end_idx].clip(0, serve_engine.audio_codebook_size - 1)
-                wv_numpy = serve_engine.audio_tokenizer.decode(vq_code.unsqueeze(0).to(DEVICE))[0, 0]
-                yield create_wav_chunk(wv_numpy, SAMPLE_RATE)
+            if end_token > start_token:
+                decode_start = max(0, start_token - DECODE_CONTEXT)
+                vq_code = reverted[:, decode_start : end_token].clip(0, serve_engine.audio_codebook_size - 1)
+                wv_full = serve_engine.audio_tokenizer.decode(vq_code.unsqueeze(0).to(DEVICE))[0, 0]
+                
+                offset = (start_token - decode_start) * samples_per_token
+                wv_chunk = wv_full[offset:]
+                
+                audio_int16 = (np.clip(wv_chunk, -1.0, 1.0) * 32767).astype(np.int16)
+                yield audio_int16.tobytes()
 
     return StreamingResponse(audio_generator(), media_type="application/octet-stream")

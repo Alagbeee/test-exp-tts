@@ -185,24 +185,31 @@
         function playAudio(arrayBuffer) {
             if (!audioContext) return;
 
-            audioContext.decodeAudioData(arrayBuffer, (buffer) => {
-                const source = audioContext.createBufferSource();
-                source.buffer = buffer;
-                source.connect(audioContext.destination);
+            // Raw PCM 24kHz Mono Int16
+            const int16Array = new Int16Array(arrayBuffer);
+            const float32Array = new Float32Array(int16Array.length);
+            for (let i = 0; i < int16Array.length; i++) {
+                float32Array[i] = int16Array[i] / 32768; // Simple Int16 to Float
+            }
 
-                // Track source for interruption
-                activeSources.add(source);
-                source.onended = () => activeSources.delete(source);
+            const audioBuffer = audioContext.createBuffer(1, float32Array.length, 24000);
+            audioBuffer.copyToChannel(float32Array, 0);
 
-                // Calculate when to start this chunk
-                const now = audioContext.currentTime;
-                if (nextStartTime < now) {
-                    nextStartTime = now + 0.1; // Small buffer for first chunk
-                }
+            const source = audioContext.createBufferSource();
+            source.buffer = audioBuffer;
+            source.connect(audioContext.destination);
 
-                source.start(nextStartTime);
-                nextStartTime += buffer.duration;
-            }, (err) => log("Error decoding audio: " + err));
+            activeSources.add(source);
+            source.onended = () => activeSources.delete(source);
+
+            const now = audioContext.currentTime;
+            if (nextStartTime < now) {
+                // Buffer 50ms ahead if we fell behind
+                nextStartTime = now + 0.05;
+            }
+
+            source.start(nextStartTime);
+            nextStartTime += audioBuffer.duration;
         }
 
         toggleBtn.addEventListener('click', () => {
