@@ -18,8 +18,8 @@ app.add_middleware(
 )
 
 # Configuration
-# options: nvidia/canary-1b
-MODEL_NAME = "nvidia/canary-1b"
+# options: nvidia/canary-1b, nvidia/canary-1b-v2
+MODEL_NAME = "nvidia/canary-1b-v2"
 # Force GPU 1
 DEVICE = "cuda:1" if torch.cuda.device_count() > 1 else "cuda:0" if torch.cuda.is_available() else "cpu"
 

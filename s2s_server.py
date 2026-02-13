@@ -114,7 +114,7 @@ async def call_groq_stream(session, text):
     payload = {
         "model": GROQ_MODEL,
         "messages": [
-            {"role": "system", "content": "You are a helpful, concise AI assistant. Provide short, natural-sounding responses suitable for a voice assistant. Keep it under 50 words."},
+            {"role": "system", "content": "You are a helpful, concise AI assistant. Provide short, natural-sounding responses suitable for a voice assistant. Always respond in the same language the user speaks to you (e.g. if they speak Dutch, you must respond in Dutch). Keep it under 50 words."},
             {"role": "user", "content": text}
         ],
         "max_tokens": 150,
