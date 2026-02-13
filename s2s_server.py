@@ -42,7 +42,7 @@ HIGGS_URL = "http://localhost:8000/generate_stream"
 # Groq Configuration
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
-GROQ_MODEL = "llama-3-8b-8192"
+GROQ_MODEL = "llama-3.1-8b-instant"
 
 SAMPLE_RATE = 16000
 VAD_THRESHOLD = 1500 # Very safe threshold to avoid self-triggering loops
