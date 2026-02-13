@@ -45,13 +45,14 @@ GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_MODEL = "llama-3.1-8b-instant"
 
 SAMPLE_RATE = 16000
-VAD_THRESHOLD = 1500 # Very safe threshold to avoid self-triggering loops
-SILENCE_DURATION = 0.6  # Seconds of silence to trigger processing
+VAD_THRESHOLD = 3000 # Increased to avoid false triggers
+SILENCE_DURATION = 0.8  # Stability over extreme speed
 MIN_AUDIO_DURATION = 0.5 # Minimum audio duration to process
 
 class ConnectionManager:
     def __init__(self):
         self.active_connections: list[WebSocket] = []
+        self.send_lock = asyncio.Lock()
 
     async def connect(self, websocket: WebSocket):
         await websocket.accept()
@@ -76,14 +77,16 @@ def create_wav_buffer(audio_data: bytes) -> io.BytesIO:
 async def safe_send_text(websocket: WebSocket, msg_dict: dict):
     try:
         if websocket.client_state == WebSocketState.CONNECTED:
-            await websocket.send_text(json.dumps(msg_dict))
+            async with manager.send_lock:
+                await websocket.send_text(json.dumps(msg_dict))
     except Exception as e:
         logger.error(f"Error sending text: {e}")
 
 async def safe_send_bytes(websocket: WebSocket, data: bytes):
     try:
         if websocket.client_state == WebSocketState.CONNECTED:
-            await websocket.send_bytes(data)
+            async with manager.send_lock:
+                await websocket.send_bytes(data)
     except Exception as e:
         logger.error(f"Error sending bytes: {e}")
 
