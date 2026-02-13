@@ -36,9 +36,8 @@ async def get():
 
 
 # Configuration
-# Assuming direct access to services on localhost without proxy path rewrites
-CANARY_URL = "http://localhost:8001/transcribe"
-HIGGS_URL = "http://localhost:8000/generate_stream"
+CANARY_URL = "http://127.0.0.1:8001/transcribe"
+HIGGS_URL = "http://127.0.0.1:8000/generate_stream"
 # Groq Configuration
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
@@ -106,7 +105,7 @@ async def safe_send_bytes(websocket: WebSocket, data: bytes):
 
 async def call_groq_stream(session, text):
     """Stream intelligent response from Groq"""
-    logger.info(f"Steaming Groq LLM for: {text}")
+    logger.info(f"Groq Payload Input: {text}")
     headers = {
         "Authorization": f"Bearer {GROQ_API_KEY}",
         "Content-Type": "application/json"
@@ -114,7 +113,13 @@ async def call_groq_stream(session, text):
     payload = {
         "model": GROQ_MODEL,
         "messages": [
-            {"role": "system", "content": "You are a helpful, concise AI assistant. Provide short, natural-sounding responses suitable for a voice assistant. Always respond in the same language the user speaks to you (e.g. if they speak Dutch, you must respond in Dutch). Keep it under 50 words."},
+            {"role": "system", "content": (
+                "You are a helpful, concise AI assistant. "
+                "CRITICAL: Respond ONLY in the same language the user used. "
+                "If the user spoke English, you MUST respond in English. "
+                "If the user spoke Dutch, you MUST respond in Dutch. "
+                "Do not mix languages. Provide short, natural-sounding responses under 50 words."
+            )},
             {"role": "user", "content": text}
         ],
         "max_tokens": 150,
@@ -186,7 +191,8 @@ async def process_audio(audio_buffer: bytes, websocket: WebSocket):
         data = aiohttp.FormData()
         data.add_field('file', wav_buffer, filename='input.wav', content_type='audio/wav')
         
-        async with session.post(CANARY_URL, data=data, timeout=15) as resp:
+        # Increase timeout to 30s for the larger v2 model's first few requests
+        async with session.post(CANARY_URL, data=data, timeout=30) as resp:
             if resp.status != 200:
                 await safe_send_text(websocket, {"state": "error", "message": f"ASR Error: {resp.status}"})
                 return
