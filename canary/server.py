@@ -51,27 +51,24 @@ async def transcribe(file: UploadFile = File(...)):
 
     try:
         # Canary expects a list of files
-        # It detects language automatically by default or we can specify
-        # For simplicity, we just transcribe
-        predicted_text = asr_model.transcribe([tmp_path])
+        # We return hypotheses to get the confidence scores
+        results = asr_model.transcribe([tmp_path], return_hypotheses=True)
         
-        # Result is usually a list, but might contain objects/dicts instead of strings
         text = ""
-        if predicted_text:
-            item = predicted_text[0]
-            print(f"DEBUG: Transcription item type: {type(item)}")
-            print(f"DEBUG: Transcription item content: {item}")
-            
-            if isinstance(item, str):
-                text = item
-            elif hasattr(item, 'text'):
-                text = item.text
-            elif isinstance(item, dict) and 'text' in item:
-                text = item['text']
-            else:
-                text = str(item) # Fallback to string representation
+        score = 0.0
         
-        return {"text": text}
+        if results and len(results) > 0:
+            # results is List[List[Hypothesis]]
+            # hyp is usually the top prediction
+            hyp = results[0]
+            if isinstance(hyp, list):
+                hyp = hyp[0]
+            
+            text = hyp.text
+            score = float(getattr(hyp, 'score', 0.0))
+            print(f"DEBUG: Transcription: '{text}' (Score: {score})")
+        
+        return {"text": text, "score": score}
     except Exception as e:
         import traceback
         traceback.print_exc()
