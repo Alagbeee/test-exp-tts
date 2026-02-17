@@ -44,7 +44,7 @@ GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_MODEL = "llama-3.1-8b-instant"
 
 SAMPLE_RATE = 16000
-VAD_THRESHOLD = 3000 # Increased to avoid false triggers
+VAD_THRESHOLD = 1500 # Lowered to catch quieter speech/distant mics
 SILENCE_DURATION = 0.8  # Stability over extreme speed
 MIN_AUDIO_DURATION = 0.5 # Minimum audio duration to process
 
@@ -221,9 +221,10 @@ async def process_audio(audio_buffer: bytes, websocket: WebSocket):
                 await safe_send_text(websocket, {"state": "idle", "message": "Listening..."})
                 return
 
-            # Filter short hallucinations
-            if not text or len(text) < 3 or text.lower() in ["problem.", "wow.", "wow", "oh."]:
-                await safe_send_text(websocket, {"state": "idle", "message": "No speech detected."})
+            # Filter short hallucinations but allowed short valid words
+            valid_shorts = ["hi", "no", "yes", "hey", "ok", "bye"]
+            if not text or (len(text) < 2 and text.lower() not in valid_shorts):
+                await safe_send_text(websocket, {"state": "idle", "message": "No clear speech detected."})
                 return
             await safe_send_text(websocket, {"state": "transcribed", "text": text})
 
@@ -316,6 +317,10 @@ async def websocket_endpoint(websocket: WebSocket):
                 
             # Calculate RMS amplitude
             energy = np.sqrt(np.mean(chunk_np.astype(float)**2))
+            
+            # Diagnostic: occasionally log energy for calibration (e.g. every 100 frames or if > 1000)
+            if energy > 1000:
+                logger.debug(f"Audio energy: {energy:.1f}")
             
             if energy > VAD_THRESHOLD:
                 if not is_speaking:
