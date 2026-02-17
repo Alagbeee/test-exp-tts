@@ -44,7 +44,7 @@ GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_MODEL = "llama-3.1-8b-instant"
 
 SAMPLE_RATE = 16000
-VAD_THRESHOLD = 1500 # Lowered to catch quieter speech/distant mics
+VAD_THRESHOLD = 1800 # Adjusted sensitivity based on user feedback
 SILENCE_DURATION = 0.8  # Stability over extreme speed
 MIN_AUDIO_DURATION = 0.5 # Minimum audio duration to process
 
@@ -221,12 +221,16 @@ async def process_audio(audio_buffer: bytes, websocket: WebSocket):
                 await safe_send_text(websocket, {"state": "idle", "message": "Listening..."})
                 return
 
-            # Filter short hallucinations but allowed short valid words
+            # Filter short hallucinations but allow clear short words if score is high
             valid_shorts = ["hi", "no", "yes", "hey", "ok", "bye"]
-            if not text or (len(text) < 2 and text.lower() not in valid_shorts):
+            if not text or (len(text) < 3 and text.lower() not in valid_shorts):
                 await safe_send_text(websocket, {"state": "idle", "message": "No clear speech detected."})
                 return
-            await safe_send_text(websocket, {"state": "transcribed", "text": text})
+            
+            # Additional score check for very short inputs to avoid noise-hallucinations
+            if len(text.split()) == 1 and score < -0.5:
+                 await safe_send_text(websocket, {"state": "idle", "message": "Ignored low-confidence noise."})
+                 return
 
     except Exception as e:
         logger.error(f"ASR Exception: {e}")
