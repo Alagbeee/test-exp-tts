@@ -64,7 +64,32 @@ class ConnectionManager:
     def get_lock(self, websocket: WebSocket):
         return self.locks.get(websocket)
 
+class ConversationManager:
+    """Manages conversation history for context awareness"""
+    def __init__(self, max_turns=10):
+        self.history: dict[WebSocket, list] = {}
+        self.max_turns = max_turns
+
+    def add_message(self, websocket: WebSocket, role: str, content: str):
+        if websocket not in self.history:
+            self.history[websocket] = []
+        
+        # Append message
+        self.history[websocket].append({"role": role, "content": content})
+        
+        # Trim history if needed (keep system prompt separate in actual call)
+        if len(self.history[websocket]) > self.max_turns:
+            self.history[websocket] = self.history[websocket][-self.max_turns:]
+
+    def get_history(self, websocket: WebSocket):
+        return self.history.get(websocket, [])
+
+    def clear(self, websocket: WebSocket):
+        if websocket in self.history:
+            del self.history[websocket]
+
 manager = ConnectionManager()
+conversation_manager = ConversationManager(max_turns=6) # Keep last 3 exchanges (User+AI)
 _global_session = None
 
 async def get_session():
@@ -103,25 +128,41 @@ async def safe_send_bytes(websocket: WebSocket, data: bytes):
     except Exception as e:
         logger.error(f"Error sending bytes: {e}")
 
-async def call_groq_stream(session, text):
-    """Stream intelligent response from Groq"""
-    logger.info(f"Groq Payload Input: {text}")
+
+async def call_groq_via_manager(session, text, websocket, session_state):
+    """Wrapper to handle history injection"""
+    # Add user message to memory
+    conversation_manager.add_message(websocket, "user", content=text)
+    
+    current_voice = "Cloned User Voice" if session_state.get("voice_mode") == "user" else "System Voice"
+    
+    messages = [
+        {"role": "system", "content": (
+            "You are a helpful, concise AI assistant. "
+            "CRITICAL: Respond ONLY in the same language the user used. "
+            "If the user spoke English, you MUST respond in English. "
+            "If the user spoke Dutch, you MUST respond in Dutch. "
+            "Do not mix languages. Provide short, natural-sounding responses under 50 words.\n\n"
+            f"Current Voice Mode: {current_voice}.\n"
+            "If the user asks to 'clone my voice' or 'speak like me', confirm you are switching to their voice.\n"
+            "If the user asks to 'reset voice' or 'stop copying', confirm you are switching back to the system voice."
+        )}
+    ]
+    
+    # Inject history
+    messages.extend(conversation_manager.get_history(websocket))
+    
+    # We don't verify the last message is the current one because we just added it.
+    # But wait, 'text' is the current user input.
+    # If we added it to history, it's already in the list.
+    
     headers = {
         "Authorization": f"Bearer {GROQ_API_KEY}",
         "Content-Type": "application/json"
     }
     payload = {
         "model": GROQ_MODEL,
-        "messages": [
-            {"role": "system", "content": (
-                "You are a helpful, concise AI assistant. "
-                "CRITICAL: Respond ONLY in the same language the user used. "
-                "If the user spoke English, you MUST respond in English. "
-                "If the user spoke Dutch, you MUST respond in Dutch. "
-                "Do not mix languages. Provide short, natural-sounding responses under 50 words."
-            )},
-            {"role": "user", "content": text}
-        ],
+        "messages": messages,
         "max_tokens": 150,
         "stream": True
     }
@@ -133,6 +174,7 @@ async def call_groq_stream(session, text):
                 yield f"Error {resp.status}"
                 return
             
+            full_response = ""
             async for line in resp.content:
                 line = line.decode('utf-8').strip()
                 if not line or line == "data: [DONE]":
@@ -142,9 +184,15 @@ async def call_groq_stream(session, text):
                         data = json.loads(line[6:])
                         chunk = data["choices"][0]["delta"].get("content", "")
                         if chunk:
+                            full_response += chunk
                             yield chunk
                     except Exception as e:
                         logger.error(f"Error parsing Groq chunk: {e}")
+            
+            # Add assistant response to memory after stream completes
+            if full_response.strip():
+                conversation_manager.add_message(websocket, "assistant", content=full_response.strip())
+                
     except Exception as e:
         logger.error(f"Groq Exception: {e}")
         yield "Thinking error."
@@ -166,12 +214,13 @@ async def split_into_sentences(text_stream):
     if buffer.strip():
         yield buffer.strip()
 
-async def process_audio(audio_buffer: bytes, websocket: WebSocket):
+async def process_audio(audio_buffer: bytes, websocket: WebSocket, session_state: dict):
     """
     1. Send Audio to Canary (ASR)
-    2. Send Text to Groq (LLM)
-    3. Send Result to Higgs (TTS)
-    4. Send Audio back to WebSocket
+    2. Save Audio for potentially cloning
+    3. Send Text to Groq (LLM)
+    4. Send Result to Higgs (TTS)
+    5. Send Audio back to WebSocket
     """
     # Calculate duration
     duration = len(audio_buffer) / (SAMPLE_RATE * 2)
@@ -181,6 +230,18 @@ async def process_audio(audio_buffer: bytes, websocket: WebSocket):
 
     logger.info(f"Processing {len(audio_buffer)} bytes ({duration:.2f}s) of audio...")
     
+    # Save user audio for cloning
+    try:
+        user_audio_path = f"/tmp/user_voice_{id(websocket)}.wav"
+        with wave.open(user_audio_path, 'wb') as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(SAMPLE_RATE)
+            wf.writeframes(audio_buffer)
+        session_state["last_user_audio"] = user_audio_path
+    except Exception as e:
+        logger.error(f"Failed to save user audio: {e}")
+
     await safe_send_text(websocket, {"state": "processing", "message": "Transcribing..."})
 
     session = await get_session()
@@ -200,6 +261,15 @@ async def process_audio(audio_buffer: bytes, websocket: WebSocket):
             text = result.get("text", "").strip()
             score = result.get("score", 0.0)
             logger.info(f"Canary Transcript: '{text}' (Score: {score})")
+            
+            # Voice Command Logic
+            text_lower = text.lower()
+            if "clone my voice" in text_lower or "speak like me" in text_lower or "copy my voice" in text_lower:
+                session_state["voice_mode"] = "user"
+                logger.info("Switching to User Voice Mode")
+            elif "reset voice" in text_lower or "normal voice" in text_lower or "stop copying" in text_lower:
+                session_state["voice_mode"] = "system"
+                logger.info("Switching to System Voice Mode")
                 
             # Confidence threshold check
             # Canary scores are log-probs; 0.0 is perfect, lower is worse.
@@ -243,7 +313,8 @@ async def process_audio(audio_buffer: bytes, websocket: WebSocket):
     full_response = ""
     try:
         # Iterate through sentences as they are generated
-        async for sentence in split_into_sentences(call_groq_stream(session, text)):
+        # Use call_groq_via_manager to include history
+        async for sentence in split_into_sentences(call_groq_via_manager(session, text, websocket, session_state)):
             full_response += " " + sentence
             logger.info(f"Sentence ready for TTS: {sentence}")
             
@@ -252,7 +323,12 @@ async def process_audio(audio_buffer: bytes, websocket: WebSocket):
             
             # Immediately call TTS for this sentence (streaming)
             try:
-                async with session.post(HIGGS_URL, json={"text": sentence}, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                # Determine voice parameters
+                tts_payload = {"text": sentence}
+                if session_state.get("voice_mode") == "user" and session_state.get("last_user_audio"):
+                    tts_payload["ref_audio_path"] = session_state["last_user_audio"]
+                
+                async with session.post(HIGGS_URL, json=tts_payload, timeout=aiohttp.ClientTimeout(total=30)) as resp:
                     if resp.status == 200:
                         # Stream the audio chunks from Higgs
                         async for chunk in resp.content.iter_any():
@@ -284,7 +360,14 @@ async def websocket_endpoint(websocket: WebSocket):
     audio_buffer = bytearray()
     silence_start = None
     is_speaking = False
+    is_speaking = False
     current_task = None
+    
+    # Session state for voice cloning
+    session_state = {
+        "voice_mode": "system",   # 'system' or 'user'
+        "last_user_audio": None
+    }
     
     try:
         while True:
@@ -362,7 +445,7 @@ async def websocket_endpoint(websocket: WebSocket):
                                 
                                 # Start as background task
                                 # Note: We don't wait for it here
-                                current_task = asyncio.create_task(process_audio(current_buffer, websocket))
+                                current_task = asyncio.create_task(process_audio(current_buffer, websocket, session_state))
                             
                             silence_start = None
                 else:
@@ -377,7 +460,8 @@ async def websocket_endpoint(websocket: WebSocket):
         manager.disconnect(websocket)
         if current_task and not current_task.done():
             current_task.cancel()
-        logger.info("Cleaned up WebSocket connection")
+        conversation_manager.clear(websocket)
+        logger.info("Cleaned up WebSocket connection and history")
 
 @app.get("/health")
 def health():

@@ -58,6 +58,8 @@ class GenerateRequest(BaseModel):
     top_p: float = 0.95
     max_new_tokens: int = 1024
     seed: int = 42
+    ref_audio_path: str = None
+    ref_text: str = None
 
 @app.get("/health")
 def health():
@@ -76,15 +78,20 @@ def generate_audio(req: GenerateRequest):
         "<|scene_desc_start|>\nAudio is recorded from a quiet room.\n<|scene_desc_end|>"
     )
 
-    # Reference turn to lock voice (professional male)
-    ref_audio_path = "/workspace/exp/higgs-audio/examples/voice_prompts/en_man.wav"
-    ref_text_path = "/workspace/exp/higgs-audio/examples/voice_prompts/en_man.txt"
-    try:
-        with open(ref_text_path, "r", encoding="utf-8") as f:
-            ref_text = f.read().strip()
-    except Exception as e:
-        print(f"Error reading ref text: {e}")
-        ref_text = "The sun rises in the east and sets in the west."
+    # Reference turn to lock voice (professional male) OR use dynamic request
+    ref_audio_path = req.ref_audio_path if req.ref_audio_path else "/workspace/exp/higgs-audio/examples/voice_prompts/en_man.wav"
+    
+    if req.ref_text:
+        ref_text = req.ref_text
+    else:
+        # Fallback to default text file if using default audio, or generic text
+        ref_text_path = "/workspace/exp/higgs-audio/examples/voice_prompts/en_man.txt"
+        try:
+            with open(ref_text_path, "r", encoding="utf-8") as f:
+                ref_text = f.read().strip()
+        except Exception as e:
+            print(f"Error reading ref text: {e}")
+            ref_text = "The sun rises in the east and sets in the west."
 
     messages = [
         Message(role="system", content=system_prompt),
@@ -135,13 +142,17 @@ async def generate_audio_stream(req: GenerateRequest):
         "<|scene_desc_start|>\nAudio is recorded from a quiet room.\n<|scene_desc_end|>"
     )
 
-    ref_audio_path = "/workspace/exp/higgs-audio/examples/voice_prompts/en_man.wav"
-    ref_text_path = "/workspace/exp/higgs-audio/examples/voice_prompts/en_man.txt"
-    try:
-        with open(ref_text_path, "r", encoding="utf-8") as f:
-            ref_text = f.read().strip()
-    except Exception:
-        ref_text = "The sun rises in the east and sets in the west."
+    ref_audio_path = req.ref_audio_path if req.ref_audio_path else "/workspace/exp/higgs-audio/examples/voice_prompts/en_man.wav"
+    
+    if req.ref_text:
+        ref_text = req.ref_text
+    else:
+        ref_text_path = "/workspace/exp/higgs-audio/examples/voice_prompts/en_man.txt"
+        try:
+            with open(ref_text_path, "r", encoding="utf-8") as f:
+                ref_text = f.read().strip()
+        except Exception:
+            ref_text = "The sun rises in the east and sets in the west."
 
     messages = [
         Message(role="system", content=system_prompt),
