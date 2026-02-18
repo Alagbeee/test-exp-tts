@@ -74,7 +74,8 @@ def generate_audio(req: GenerateRequest):
         raise HTTPException(status_code=503, detail="Model not loaded")
 
     system_prompt = (
-        "Generate audio. Use a steady, consistent, and calm professional male voice. Maintain the same pitch and emotional tone throughout.\n\n"
+        "Generate audio. Use a professional male voice. Adapt the emotional tone to the content. "
+        "If the text is funny, sound amused. If it includes laughter (e.g. 'Haha'), ensure the voice laughs naturally.\n\n"
         "<|scene_desc_start|>\nAudio is recorded from a quiet room.\n<|scene_desc_end|>"
     )
 
@@ -138,7 +139,8 @@ async def generate_audio_stream(req: GenerateRequest):
         raise HTTPException(status_code=503, detail="Model not loaded")
 
     system_prompt = (
-        "Generate audio. Use a steady, consistent, and calm professional male voice. Maintain the same pitch and emotional tone throughout.\n\n"
+        "Generate audio. Use a professional male voice. Adapt the emotional tone to the content. "
+        "If the text is funny, sound amused. If it includes laughter (e.g. 'Haha'), ensure the voice laughs naturally.\n\n"
         "<|scene_desc_start|>\nAudio is recorded from a quiet room.\n<|scene_desc_end|>"
     )
 

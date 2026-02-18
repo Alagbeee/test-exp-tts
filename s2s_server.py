@@ -13,7 +13,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from starlette.websockets import WebSocketState
 
 # Configure logging
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger("S2S-Orchestrator")
 
 app = FastAPI()
@@ -142,7 +142,8 @@ async def call_groq_via_manager(session, text, websocket, session_state):
             "CRITICAL: Respond ONLY in the same language the user used. "
             "If the user spoke English, you MUST respond in English. "
             "If the user spoke Dutch, you MUST respond in Dutch. "
-            "Do not mix languages. Provide short, natural-sounding responses under 50 words.\n\n"
+            "Do not mix languages. Provide short, natural-sounding responses under 50 words. "
+            "You CAN laugh if the user is funny, using 'Haha' or '*laughs*'. Be expressive.\n\n"
             f"Current Voice Mode: {current_voice}.\n"
             "If the user asks to 'clone my voice' or 'speak like me', confirm you are switching to their voice.\n"
             "If the user asks to 'reset voice' or 'stop copying', confirm you are switching back to the system voice."
