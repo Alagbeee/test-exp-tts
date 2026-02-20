@@ -73,11 +73,21 @@ def generate_audio(req: GenerateRequest):
     if serve_engine is None:
         raise HTTPException(status_code=503, detail="Model not loaded")
 
-    system_prompt = (
-        "Generate audio. Use a professional male voice. Adapt the emotional tone to the content. "
-        "If the text is funny, sound amused. If it includes laughter (e.g. 'Haha'), ensure the voice laughs naturally.\n\n"
-        "<|scene_desc_start|>\nAudio is recorded from a quiet room.\n<|scene_desc_end|>"
-    )
+    if req.ref_audio_path:
+        system_prompt = (
+            "Generate audio matching the speaker's voice in the reference audio. "
+            "CRITICAL: Use a single, consistent speaker. Do not switch voices, do not change pitch abruptly, "
+            "and do not simulate a conversation between multiple people. "
+            "Adapt the emotional tone to the content. If the text is funny, sound amused. "
+            "If it includes laughter (e.g. 'Haha'), ensure the voice laughs naturally.\n\n"
+            "<|scene_desc_start|>\nAudio is recorded from a quiet room.\n<|scene_desc_end|>"
+        )
+    else:
+        system_prompt = (
+            "Generate audio. Use a professional male voice. Adapt the emotional tone to the content. "
+            "If the text is funny, sound amused. If it includes laughter (e.g. 'Haha'), ensure the voice laughs naturally.\n\n"
+            "<|scene_desc_start|>\nAudio is recorded from a quiet room.\n<|scene_desc_end|>"
+        )
 
     # Reference turn to lock voice (professional male) OR use dynamic request
     ref_audio_path = req.ref_audio_path if req.ref_audio_path else "/workspace/exp/higgs-audio/examples/voice_prompts/en_man.wav"
@@ -138,11 +148,21 @@ async def generate_audio_stream(req: GenerateRequest):
     if serve_engine is None:
         raise HTTPException(status_code=503, detail="Model not loaded")
 
-    system_prompt = (
-        "Generate audio. Use a professional male voice. Adapt the emotional tone to the content. "
-        "If the text is funny, sound amused. If it includes laughter (e.g. 'Haha'), ensure the voice laughs naturally.\n\n"
-        "<|scene_desc_start|>\nAudio is recorded from a quiet room.\n<|scene_desc_end|>"
-    )
+    if req.ref_audio_path:
+        system_prompt = (
+            "Generate audio matching the speaker's voice in the reference audio. "
+            "CRITICAL: Use a single, consistent speaker. Do not switch voices, do not change pitch abruptly, "
+            "and do not simulate a conversation between multiple people. "
+            "Adapt the emotional tone to the content. If the text is funny, sound amused. "
+            "If it includes laughter (e.g. 'Haha'), ensure the voice laughs naturally.\n\n"
+            "<|scene_desc_start|>\nAudio is recorded from a quiet room.\n<|scene_desc_end|>"
+        )
+    else:
+        system_prompt = (
+            "Generate audio. Use a professional male voice. Adapt the emotional tone to the content. "
+            "If the text is funny, sound amused. If it includes laughter (e.g. 'Haha'), ensure the voice laughs naturally.\n\n"
+            "<|scene_desc_start|>\nAudio is recorded from a quiet room.\n<|scene_desc_end|>"
+        )
 
     ref_audio_path = req.ref_audio_path if req.ref_audio_path else "/workspace/exp/higgs-audio/examples/voice_prompts/en_man.wav"
     
@@ -205,13 +225,56 @@ async def generate_audio_stream(req: GenerateRequest):
                         
                         wv_full = serve_engine.audio_tokenizer.decode(vq_code.unsqueeze(0).to(DEVICE))[0, 0]
                         
-                        # Extract the part we haven't yielded yet
+                        # We want to yield up to `end_token`, but we also need a small overlap for crossfading
+                        OVERLAP_SAMPLES = 160  # ~6.6ms at 24kHz
+                        
                         offset = (start_token - decode_start) * samples_per_token
                         count = (end_token - start_token) * samples_per_token
-                        wv_chunk = wv_full[offset : offset + count]
+                        
+                        # Only apply crossfade if we have yielded before and have overlap data
+                        if yielded_tokens > 0:
+                            # Start slightly earlier to get the overlap region
+                            wv_chunk = wv_full[offset - OVERLAP_SAMPLES : offset + count]
+                            
+                            # Linear crossfade curve
+                            fade_in = np.linspace(0, 1, OVERLAP_SAMPLES)
+                            fade_out = np.linspace(1, 0, OVERLAP_SAMPLES)
+                            
+                            # We blend the first OVERLAP_SAMPLES of this chunk with the end of the last chunk
+                            # The client receives the overlapping bit TWICE but we assume S2S handles it, 
+                            # OR we manage the overlap buffer entirely here:
+                            
+                            # BETTER: We just manage the overlap internally.
+                            # The chunk we yield starts exactly at `offset`, but the beginning is faded.
+                            pass # We will use a simpler overlap-save method below
+                        
+                        # SIMPLIFIED ROBUST OVERLAP-ADD:
+                        # We decode slightly past the boundary but only yield the exact new samples.
+                        # The `DECODE_CONTEXT` already prevents *model* edge artifacts.
+                        # The clicks the user hears are *waveform discontinuity* between chunk N and N+1.
+                        # Wait, `wv_chunk = wv_full[offset : offset + count]` should be perfectly contiguous 
+                        # IF the model output is deterministic for those tokens. 
+                        # However, VAE decoding is stateful/convolutional. 
+                        # To ensure perfectly seamless audio, we must blend the overlapping outputs of the VAE.
+                        
+                        # Extract the newly minted audio, PLUS an overlap region from the context
+                        blend_offset = offset - OVERLAP_SAMPLES if yielded_tokens > 0 else offset
+                        blend_count = count + OVERLAP_SAMPLES if yielded_tokens > 0 else count
+                        
+                        wv_chunk = wv_full[blend_offset : blend_offset + blend_count].copy()
+                        
+                        if yielded_tokens > 0 and hasattr(audio_generator, 'last_overlap'):
+                            # Blend the start of this chunk with the saved overlap from the previous chunk
+                            fade_in = np.linspace(0, 1, OVERLAP_SAMPLES)
+                            fade_out = np.linspace(1, 0, OVERLAP_SAMPLES)
+                            wv_chunk[:OVERLAP_SAMPLES] = (wv_chunk[:OVERLAP_SAMPLES] * fade_in) + (audio_generator.last_overlap * fade_out)
+                        
+                        # Save the end of this chunk for the NEXT blend, and truncate it from what we yield now
+                        audio_generator.last_overlap = wv_chunk[-OVERLAP_SAMPLES:].copy()
+                        wv_yield = wv_chunk[:-OVERLAP_SAMPLES] if yielded_tokens > 0 else wv_chunk
                         
                         # Yield raw PCM int16
-                        audio_int16 = (np.clip(wv_chunk, -1.0, 1.0) * 32767).astype(np.int16)
+                        audio_int16 = (np.clip(wv_yield, -1.0, 1.0) * 32767).astype(np.int16)
                         yield audio_int16.tobytes()
                         yielded_tokens = end_token
 
@@ -228,8 +291,17 @@ async def generate_audio_stream(req: GenerateRequest):
                 vq_code = reverted[:, decode_start : end_token].clip(0, serve_engine.audio_codebook_size - 1)
                 wv_full = serve_engine.audio_tokenizer.decode(vq_code.unsqueeze(0).to(DEVICE))[0, 0]
                 
+                OVERLAP_SAMPLES = 160
                 offset = (start_token - decode_start) * samples_per_token
-                wv_chunk = wv_full[offset:]
+                blend_offset = offset - OVERLAP_SAMPLES if yielded_tokens > 0 else offset
+                wv_chunk = wv_full[blend_offset:].copy()
+                
+                if yielded_tokens > 0 and hasattr(audio_generator, 'last_overlap'):
+                    fade_in = np.linspace(0, 1, OVERLAP_SAMPLES)
+                    fade_out = np.linspace(1, 0, OVERLAP_SAMPLES)
+                    # Safely blend if we have enough samples
+                    if len(wv_chunk) >= OVERLAP_SAMPLES:
+                        wv_chunk[:OVERLAP_SAMPLES] = (wv_chunk[:OVERLAP_SAMPLES] * fade_in) + (audio_generator.last_overlap * fade_out)
                 
                 audio_int16 = (np.clip(wv_chunk, -1.0, 1.0) * 32767).astype(np.int16)
                 yield audio_int16.tobytes()

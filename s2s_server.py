@@ -143,7 +143,7 @@ async def call_groq_via_manager(session, text, websocket, session_state):
             "If the user spoke English, you MUST respond in English. "
             "If the user spoke Dutch, you MUST respond in Dutch. "
             "Do not mix languages. Provide short, natural-sounding responses under 50 words. "
-            "You CAN laugh if the user is funny, using 'Haha' or '*laughs*'. Be expressive.\n\n"
+            "You CAN laugh if the user is funny, but you MUST ONLY use 'Haha' or 'Hehe'. NEVER use asterisks or actions like '*laughs*'.\n\n"
             f"Current Voice Mode: {current_voice}.\n"
             "If the user asks to 'clone my voice' or 'speak like me', confirm you are switching to their voice.\n"
             "If the user asks to 'reset voice' or 'stop copying', confirm you are switching back to the system voice."
@@ -239,7 +239,7 @@ async def process_audio(audio_buffer: bytes, websocket: WebSocket, session_state
             wf.setsampwidth(2)
             wf.setframerate(SAMPLE_RATE)
             wf.writeframes(audio_buffer)
-        session_state["last_user_audio"] = user_audio_path
+        session_state["current_audio_chunk"] = user_audio_path
     except Exception as e:
         logger.error(f"Failed to save user audio: {e}")
 
@@ -265,9 +265,23 @@ async def process_audio(audio_buffer: bytes, websocket: WebSocket, session_state
             
             # Voice Command Logic
             text_lower = text.lower()
-            if "clone my voice" in text_lower or "speak like me" in text_lower or "copy my voice" in text_lower:
+            clone_cmds = ["clone my voice", "speak like me", "copy my voice", "switch to my voice", "speak in my voice", "learn my voice"]
+            is_command = any(cmd in text_lower for cmd in clone_cmds + ["reset voice", "normal voice", "stop copying", "your voice"])
+            
+            # Save the transcript for voice cloning reference
+            if text and len(text.split()) >= 3 and not is_command:
+                session_state["best_user_text"] = text
+                if "current_audio_chunk" in session_state:
+                    session_state["best_user_audio"] = session_state["current_audio_chunk"]
+                    logger.info(f"Saved new voice reference: '{text}' at {session_state['best_user_audio']}")
+            
+            if any(cmd in text_lower for cmd in clone_cmds):
                 session_state["voice_mode"] = "user"
-                logger.info("Switching to User Voice Mode")
+                logger.info("Switched to User Voice Mode")
+                if "best_user_audio" in session_state:
+                    logger.info(f"Active Clone Reference: '{session_state.get('best_user_text')}'")
+                else:
+                    logger.warning("User Voice Mode activated, but NO reference audio is saved yet!")
             elif "reset voice" in text_lower or "normal voice" in text_lower or "stop copying" in text_lower:
                 session_state["voice_mode"] = "system"
                 logger.info("Switching to System Voice Mode")
@@ -326,8 +340,11 @@ async def process_audio(audio_buffer: bytes, websocket: WebSocket, session_state
             try:
                 # Determine voice parameters
                 tts_payload = {"text": sentence}
-                if session_state.get("voice_mode") == "user" and session_state.get("last_user_audio"):
-                    tts_payload["ref_audio_path"] = session_state["last_user_audio"]
+                if session_state.get("voice_mode") == "user" and session_state.get("best_user_audio"):
+                    tts_payload["ref_audio_path"] = session_state["best_user_audio"]
+                    tts_payload["temperature"] = 0.3 # Lower temperature for stable voice cloning
+                    if session_state.get("best_user_text"):
+                        tts_payload["ref_text"] = session_state["best_user_text"]
                 
                 async with session.post(HIGGS_URL, json=tts_payload, timeout=aiohttp.ClientTimeout(total=30)) as resp:
                     if resp.status == 200:
