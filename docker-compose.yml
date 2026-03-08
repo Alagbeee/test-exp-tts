@@ -7,8 +7,15 @@ services:
       - "8000:8000"
     environment:
       - HF_TOKEN=${HF_TOKEN}
+      - HIGGS_AUDIO_ROOT=/workspace/higgs-audio
     volumes:
       - ./higgs-audio:/workspace/higgs-audio
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=5).read()"]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+      start_period: 120s
     deploy:
       resources:
         reservations:
@@ -25,6 +32,12 @@ services:
       - "8001:8001"
     environment:
       - NGC_API_KEY=${NGC_API_KEY}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8001/health', timeout=5).read()"]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+      start_period: 180s
     deploy:
       resources:
         reservations:
@@ -33,19 +46,24 @@ services:
               count: 1
               capabilities: [gpu]
 
-  frontend:
-    image: nginx:alpine
+  s2s-service:
+    build:
+      context: .
+      dockerfile: s2s/Dockerfile
     ports:
-      - "8080:80"
-    volumes:
-      - ./frontend/index.html:/usr/share/nginx/html/index.html
-      - ./frontend/nginx.conf:/etc/nginx/nginx.conf
+      - "8082:8082"
+    environment:
+      - GROQ_API_KEY=${GROQ_API_KEY}
+      - CANARY_URL=http://canary-service:8001/transcribe
+      - HIGGS_URL=http://higgs-service:8000/generate_stream
     depends_on:
-      - higgs-service
-      - canary-service
+      higgs-service:
+        condition: service_healthy
+      canary-service:
+        condition: service_healthy
 
   tunnel:
     image: cloudflare/cloudflared:latest
-    command: tunnel --url http://frontend:80
+    command: tunnel --no-autoupdate --url http://s2s-service:8082
     depends_on:
-      - frontend
+      - s2s-service

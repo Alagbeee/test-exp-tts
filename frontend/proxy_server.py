@@ -57,7 +57,7 @@ async def proxy_request(url: str, request: Request):
 # Mount root to serve index.html? 
 # Usually we mount /static. For root, we can use a catch-all or just serve index.
 # Let's verify if index.html is in /workspace/exp/frontend
-FRONTEND_DIR = "/workspace/exp/frontend"
+FRONTEND_DIR = "/root/test-exp-tts/frontend"
 
 @app.get("/")
 async def read_index():

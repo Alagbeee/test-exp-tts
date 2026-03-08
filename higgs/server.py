@@ -2,6 +2,8 @@ from fastapi import FastAPI, HTTPException, Body
 from fastapi.responses import Response, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from pathlib import Path
+import os
 import torch
 import time
 import io
@@ -10,7 +12,13 @@ import torch
 import torchaudio
 import soundfile as sf
 from fastapi import FastAPI, Response, HTTPException
-sys.path.append("/workspace/exp/higgs-audio")
+
+APP_ROOT = Path(__file__).resolve().parent
+HIGGS_AUDIO_ROOT = Path(os.environ.get("HIGGS_AUDIO_ROOT", APP_ROOT / "higgs-audio"))
+DEFAULT_REF_AUDIO_PATH = HIGGS_AUDIO_ROOT / "examples/voice_prompts/en_man.wav"
+DEFAULT_REF_TEXT_PATH = HIGGS_AUDIO_ROOT / "examples/voice_prompts/en_man.txt"
+
+sys.path.append(str(HIGGS_AUDIO_ROOT))
 
 import numpy as np
 from boson_multimodal.serve.serve_engine import HiggsAudioServeEngine, HiggsAudioResponse
@@ -59,6 +67,7 @@ class GenerateRequest(BaseModel):
     max_new_tokens: int = 1024
     seed: int = 42
     ref_audio_path: str = None
+    ref_audio_base64: str = None
     ref_text: str = None
 
 @app.get("/health")
@@ -73,7 +82,8 @@ def generate_audio(req: GenerateRequest):
     if serve_engine is None:
         raise HTTPException(status_code=503, detail="Model not loaded")
 
-    if req.ref_audio_path:
+    has_custom_voice = req.ref_audio_base64 or req.ref_audio_path
+    if has_custom_voice:
         system_prompt = (
             "Generate audio matching the speaker's voice in the reference audio. "
             "CRITICAL: Use a single, consistent speaker. Do not switch voices, do not change pitch abruptly, "
@@ -89,16 +99,20 @@ def generate_audio(req: GenerateRequest):
             "<|scene_desc_start|>\nAudio is recorded from a quiet room.\n<|scene_desc_end|>"
         )
 
-    # Reference turn to lock voice (professional male) OR use dynamic request
-    ref_audio_path = req.ref_audio_path if req.ref_audio_path else "/workspace/exp/higgs-audio/examples/voice_prompts/en_man.wav"
+    # Build reference audio content
+    if req.ref_audio_base64:
+        ref_audio_content = AudioContent(raw_audio=req.ref_audio_base64, audio_url="placeholder")
+    elif req.ref_audio_path:
+        ref_audio_content = AudioContent(audio_url=req.ref_audio_path)
+    else:
+        ref_audio_content = AudioContent(audio_url=str(DEFAULT_REF_AUDIO_PATH))
     
     if req.ref_text:
         ref_text = req.ref_text
     else:
         # Fallback to default text file if using default audio, or generic text
-        ref_text_path = "/workspace/exp/higgs-audio/examples/voice_prompts/en_man.txt"
         try:
-            with open(ref_text_path, "r", encoding="utf-8") as f:
+            with open(DEFAULT_REF_TEXT_PATH, "r", encoding="utf-8") as f:
                 ref_text = f.read().strip()
         except Exception as e:
             print(f"Error reading ref text: {e}")
@@ -107,7 +121,7 @@ def generate_audio(req: GenerateRequest):
     messages = [
         Message(role="system", content=system_prompt),
         Message(role="user", content=ref_text),
-        Message(role="assistant", content=AudioContent(audio_url=ref_audio_path)),
+        Message(role="assistant", content=ref_audio_content),
         Message(role="user", content=req.text),
     ]
 
@@ -148,7 +162,8 @@ async def generate_audio_stream(req: GenerateRequest):
     if serve_engine is None:
         raise HTTPException(status_code=503, detail="Model not loaded")
 
-    if req.ref_audio_path:
+    has_custom_voice = req.ref_audio_base64 or req.ref_audio_path
+    if has_custom_voice:
         system_prompt = (
             "Generate audio matching the speaker's voice in the reference audio. "
             "CRITICAL: Use a single, consistent speaker. Do not switch voices, do not change pitch abruptly, "
@@ -164,14 +179,19 @@ async def generate_audio_stream(req: GenerateRequest):
             "<|scene_desc_start|>\nAudio is recorded from a quiet room.\n<|scene_desc_end|>"
         )
 
-    ref_audio_path = req.ref_audio_path if req.ref_audio_path else "/workspace/exp/higgs-audio/examples/voice_prompts/en_man.wav"
+    # Build reference audio content
+    if req.ref_audio_base64:
+        ref_audio_content = AudioContent(raw_audio=req.ref_audio_base64, audio_url="placeholder")
+    elif req.ref_audio_path:
+        ref_audio_content = AudioContent(audio_url=req.ref_audio_path)
+    else:
+        ref_audio_content = AudioContent(audio_url=str(DEFAULT_REF_AUDIO_PATH))
     
     if req.ref_text:
         ref_text = req.ref_text
     else:
-        ref_text_path = "/workspace/exp/higgs-audio/examples/voice_prompts/en_man.txt"
         try:
-            with open(ref_text_path, "r", encoding="utf-8") as f:
+            with open(DEFAULT_REF_TEXT_PATH, "r", encoding="utf-8") as f:
                 ref_text = f.read().strip()
         except Exception:
             ref_text = "The sun rises in the east and sets in the west."
@@ -179,7 +199,7 @@ async def generate_audio_stream(req: GenerateRequest):
     messages = [
         Message(role="system", content=system_prompt),
         Message(role="user", content=ref_text),
-        Message(role="assistant", content=AudioContent(audio_url=ref_audio_path)),
+        Message(role="assistant", content=ref_audio_content),
         Message(role="user", content=req.text),
     ]
 

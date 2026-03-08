@@ -21,9 +21,10 @@ COPY higgs-audio /workspace/higgs-audio
 
 # Install Higgs Audio dependencies
 RUN pip install -r requirements.txt
+RUN pip uninstall -y flash-attn || true
 RUN pip install -e .
 
-# Copy server script
+# Copy server script outside the bind-mounted repo path so the container keeps it at runtime.
 COPY higgs/server.py /workspace/server.py
 
-CMD ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["uvicorn", "--app-dir", "/workspace", "server:app", "--host", "0.0.0.0", "--port", "8000"]

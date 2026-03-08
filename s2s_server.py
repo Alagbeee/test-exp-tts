@@ -6,6 +6,8 @@ import io
 import wave
 import struct
 import time
+import base64
+from pathlib import Path
 import aiohttp
 import numpy as np
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -28,16 +30,19 @@ app.add_middleware(
 
 from fastapi.responses import HTMLResponse
 
+APP_ROOT = Path(__file__).resolve().parent
+FRONTEND_PATH = Path(os.environ.get("S2S_FRONTEND_PATH", APP_ROOT / "s2s_frontend" / "index.html"))
+
 @app.get("/")
 @app.head("/")
 async def get():
-    with open("/workspace/exp/s2s_frontend/index.html", "r") as f:
+    with open(FRONTEND_PATH, "r", encoding="utf-8") as f:
         return HTMLResponse(content=f.read())
 
 
 # Configuration
-CANARY_URL = "http://127.0.0.1:8001/transcribe"
-HIGGS_URL = "http://127.0.0.1:8000/generate_stream"
+CANARY_URL = os.environ.get("CANARY_URL", "http://127.0.0.1:8001/transcribe")
+HIGGS_URL = os.environ.get("HIGGS_URL", "http://127.0.0.1:8000/generate_stream")
 # Groq Configuration
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
@@ -138,14 +143,18 @@ async def call_groq_via_manager(session, text, websocket, session_state):
     
     messages = [
         {"role": "system", "content": (
-            "You are a helpful, concise AI assistant. "
+            "You are a state-of-the-art Real-time Speech-to-Speech (S2S) AI assistant. "
+            "You can hear the user and respond with a synthetic voice. "
             "CRITICAL: Respond ONLY in the same language the user used. "
             "If the user spoke English, you MUST respond in English. "
             "If the user spoke Dutch, you MUST respond in Dutch. "
             "Do not mix languages. Provide short, natural-sounding responses under 50 words. "
             "You CAN laugh if the user is funny, but you MUST ONLY use 'Haha' or 'Hehe'. NEVER use asterisks or actions like '*laughs*'.\n\n"
             f"Current Voice Mode: {current_voice}.\n"
-            "If the user asks to 'clone my voice' or 'speak like me', confirm you are switching to their voice.\n"
+            "You HAVE the capability to clone the user's voice. "
+            "If the user asks to 'clone my voice' or 'speak like me':\n"
+            "1. If you have learned their voice, confirm you are switching.\n"
+            "2. If you haven't heard enough yet, explain that you need them to speak a bit more (at least 3-4 words) so you can learn their voice pattern before you can clone it.\n"
             "If the user asks to 'reset voice' or 'stop copying', confirm you are switching back to the system voice."
         )}
     ]
@@ -265,8 +274,16 @@ async def process_audio(audio_buffer: bytes, websocket: WebSocket, session_state
             
             # Voice Command Logic
             text_lower = text.lower()
-            clone_cmds = ["clone my voice", "speak like me", "copy my voice", "switch to my voice", "speak in my voice", "learn my voice"]
-            is_command = any(cmd in text_lower for cmd in clone_cmds + ["reset voice", "normal voice", "stop copying", "your voice"])
+            # Broaden trigger list to handle common ASR mis-transcriptions
+            clone_cmds = [
+                "clone my voice", "speak like me", "copy my voice", 
+                "switch to my voice", "speak in my voice", "learn my voice",
+                "close my voice", "cloud my voice", "clone voice", "clown my voice"
+            ]
+            reset_cmds = ["reset voice", "normal voice", "stop copying", "your voice", "system voice"]
+            is_clone_cmd = any(cmd in text_lower for cmd in clone_cmds)
+            is_reset_cmd = any(cmd in text_lower for cmd in reset_cmds)
+            is_command = is_clone_cmd or is_reset_cmd
             
             # Save the transcript for voice cloning reference
             if text and len(text.split()) >= 3 and not is_command:
@@ -275,14 +292,17 @@ async def process_audio(audio_buffer: bytes, websocket: WebSocket, session_state
                     session_state["best_user_audio"] = session_state["current_audio_chunk"]
                     logger.info(f"Saved new voice reference: '{text}' at {session_state['best_user_audio']}")
             
-            if any(cmd in text_lower for cmd in clone_cmds):
-                session_state["voice_mode"] = "user"
-                logger.info("Switched to User Voice Mode")
+            if is_clone_cmd:
                 if "best_user_audio" in session_state:
+                    session_state["voice_mode"] = "user"
+                    logger.info("Switched to User Voice Mode")
                     logger.info(f"Active Clone Reference: '{session_state.get('best_user_text')}'")
                 else:
-                    logger.warning("User Voice Mode activated, but NO reference audio is saved yet!")
-            elif "reset voice" in text_lower or "normal voice" in text_lower or "stop copying" in text_lower:
+                    logger.warning("User requested clone, but NO reference audio yet.")
+                    # We'll let the LLM handle the explanation via the system prompt update
+                    # But we stay in system mode for now.
+                    session_state["voice_mode"] = "system" 
+            elif is_reset_cmd:
                 session_state["voice_mode"] = "system"
                 logger.info("Switching to System Voice Mode")
                 
@@ -341,7 +361,12 @@ async def process_audio(audio_buffer: bytes, websocket: WebSocket, session_state
                 # Determine voice parameters
                 tts_payload = {"text": sentence}
                 if session_state.get("voice_mode") == "user" and session_state.get("best_user_audio"):
-                    tts_payload["ref_audio_path"] = session_state["best_user_audio"]
+                    try:
+                        with open(session_state["best_user_audio"], "rb") as af:
+                            audio_bytes = af.read()
+                        tts_payload["ref_audio_base64"] = base64.b64encode(audio_bytes).decode("utf-8")
+                    except Exception as e:
+                        logger.error(f"Failed to read ref audio for base64: {e}")
                     tts_payload["temperature"] = 0.3 # Lower temperature for stable voice cloning
                     if session_state.get("best_user_text"):
                         tts_payload["ref_text"] = session_state["best_user_text"]
