@@ -1,5 +1,6 @@
 services:
   higgs-service:
+    image: 15wins/higgs:latest
     build:
       context: .
       dockerfile: higgs/Dockerfile
@@ -25,6 +26,7 @@ services:
               capabilities: [gpu]
 
   canary-service:
+    image: 15wins/canary:latest
     build:
       context: .
       dockerfile: canary/Dockerfile
@@ -47,6 +49,7 @@ services:
               capabilities: [gpu]
 
   s2s-service:
+    image: 15wins/s2s:latest
     build:
       context: .
       dockerfile: s2s/Dockerfile
