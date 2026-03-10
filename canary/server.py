@@ -23,11 +23,22 @@ MODEL_NAME = "nvidia/canary-1b-v2"
 # Force GPU 1
 DEVICE = "cuda:1" if torch.cuda.device_count() > 1 else "cuda:0" if torch.cuda.is_available() else "cpu"
 
-print(f"Loading Canary model {MODEL_NAME} on {DEVICE}...")
+CANARY_MODEL_PATH = os.environ.get("CANARY_MODEL_PATH", None)
+
+print(f"Loading Canary model on {DEVICE}...")
 try:
-    # This will download the model if not present
-    asr_model = nemo_asr.models.EncDecMultiTaskModel.from_pretrained(model_name=MODEL_NAME)
-    asr_model.to(DEVICE)
+    if CANARY_MODEL_PATH:
+        import glob
+        nemo_files = glob.glob(os.path.join(CANARY_MODEL_PATH, "*.nemo"))
+        if nemo_files:
+            print(f"Loading from baked-in weights: {nemo_files[0]}")
+            asr_model = nemo_asr.models.EncDecMultiTaskModel.restore_from(nemo_files[0])
+        else:
+            print(f"No .nemo file found in {CANARY_MODEL_PATH}, falling back to from_pretrained")
+            asr_model = nemo_asr.models.EncDecMultiTaskModel.from_pretrained(model_name=MODEL_NAME)
+    else:
+        asr_model = nemo_asr.models.EncDecMultiTaskModel.from_pretrained(model_name=MODEL_NAME)
+    asr_model = asr_model.to(DEVICE)
     print("Canary model loaded successfully.")
 except Exception as e:
     print(f"Error loading model: {e}")

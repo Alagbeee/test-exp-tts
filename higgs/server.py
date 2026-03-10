@@ -37,8 +37,8 @@ app.add_middleware(
 )
 
 # Configuration
-MODEL_PATH = "bosonai/higgs-audio-v2-generation-3B-base"
-AUDIO_TOKENIZER_PATH = "bosonai/higgs-audio-v2-tokenizer"
+MODEL_PATH = os.environ.get("HIGGS_MODEL_PATH", "bosonai/higgs-audio-v2-generation-3B-base")
+AUDIO_TOKENIZER_PATH = os.environ.get("HIGGS_TOKENIZER_PATH", "bosonai/higgs-audio-v2-tokenizer")
 # Force GPU 0 if available, else CPU (though Higgs needs GPU)
 DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
 SAMPLE_RATE = 24000

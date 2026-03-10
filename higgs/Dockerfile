@@ -27,4 +27,21 @@ RUN pip install -e .
 # Copy server script outside the bind-mounted repo path so the container keeps it at runtime.
 COPY higgs/server.py /workspace/server.py
 
+# Bake model weights into the image at build time for instant cold starts.
+# Pass --build-arg HF_TOKEN=xxx if the repos require authentication.
+ARG HF_TOKEN=""
+RUN HF_TOKEN="${HF_TOKEN}" python3 -c "
+import os
+from huggingface_hub import snapshot_download
+tok = os.environ.get('HF_TOKEN') or None
+print('Downloading higgs-audio-v2-generation-3B-base...')
+snapshot_download('bosonai/higgs-audio-v2-generation-3B-base', local_dir='/models/higgs', token=tok)
+print('Downloading higgs-audio-v2-tokenizer...')
+snapshot_download('bosonai/higgs-audio-v2-tokenizer', local_dir='/models/higgs-tokenizer', token=tok)
+print('Model download complete.')
+"
+
+ENV HIGGS_MODEL_PATH=/models/higgs
+ENV HIGGS_TOKENIZER_PATH=/models/higgs-tokenizer
+
 CMD ["uvicorn", "--app-dir", "/workspace", "server:app", "--host", "0.0.0.0", "--port", "8000"]
