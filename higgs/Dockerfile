@@ -30,16 +30,9 @@ COPY higgs/server.py /workspace/server.py
 # Bake model weights into the image at build time for instant cold starts.
 # Pass --build-arg HF_TOKEN=xxx if the repos require authentication.
 ARG HF_TOKEN=""
-RUN HF_TOKEN="${HF_TOKEN}" python3 -c "
-import os
-from huggingface_hub import snapshot_download
-tok = os.environ.get('HF_TOKEN') or None
-print('Downloading higgs-audio-v2-generation-3B-base...')
-snapshot_download('bosonai/higgs-audio-v2-generation-3B-base', local_dir='/models/higgs', token=tok)
-print('Downloading higgs-audio-v2-tokenizer...')
-snapshot_download('bosonai/higgs-audio-v2-tokenizer', local_dir='/models/higgs-tokenizer', token=tok)
-print('Model download complete.')
-"
+ENV HF_TOKEN=${HF_TOKEN}
+COPY higgs/download_models.py /tmp/download_models.py
+RUN python3 /tmp/download_models.py
 
 ENV HIGGS_MODEL_PATH=/models/higgs
 ENV HIGGS_TOKENIZER_PATH=/models/higgs-tokenizer
