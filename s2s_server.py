@@ -48,6 +48,71 @@ GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_MODEL = "llama-3.1-8b-instant"
 
+# Vast.ai Serverless configuration (optional — set these to route ASR/TTS through Vast)
+VAST_API_KEY = os.environ.get("VAST_API_KEY")
+VAST_CANARY_ENDPOINT = os.environ.get("VAST_CANARY_ENDPOINT")  # e.g. "canary-asr"
+VAST_HIGGS_ENDPOINT = os.environ.get("VAST_HIGGS_ENDPOINT")    # e.g. "higgs-tts"
+USE_VAST = bool(VAST_API_KEY and VAST_CANARY_ENDPOINT and VAST_HIGGS_ENDPOINT)
+
+_vast_client = None
+_vast_endpoints: dict = {}
+
+async def get_vast_client():
+    global _vast_client
+    if _vast_client is None:
+        from vastai import Serverless
+        _vast_client = Serverless(VAST_API_KEY)
+    return _vast_client
+
+async def get_vast_endpoint(name: str):
+    if name not in _vast_endpoints:
+        client = await get_vast_client()
+        _vast_endpoints[name] = await client.get_endpoint(name)
+    return _vast_endpoints[name]
+
+async def vast_transcribe(audio_buffer: bytes) -> dict:
+    """Send audio to Canary on Vast.ai and return {text, score}."""
+    client = await get_vast_client()
+    endpoint = await get_vast_endpoint(VAST_CANARY_ENDPOINT)
+    audio_b64 = base64.b64encode(audio_buffer).decode()
+    # create_wav_buffer is defined below; we need raw WAV bytes here
+    wav_io = io.BytesIO()
+    with wave.open(wav_io, 'wb') as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(SAMPLE_RATE)
+        wf.writeframes(audio_buffer)
+    wav_b64 = base64.b64encode(wav_io.getvalue()).decode()
+    req = client.queue_endpoint_request(
+        endpoint=endpoint,
+        worker_route="/transcribe_b64",
+        worker_payload={"audio_b64": wav_b64},
+        timeout=60.0,
+        worker_timeout=30.0,
+    )
+    result = await asyncio.wrap_future(req)
+    return result.get("response", {})
+
+async def vast_tts(payload: dict) -> bytes:
+    """Send TTS request to Higgs on Vast.ai, return raw PCM bytes."""
+    client = await get_vast_client()
+    endpoint = await get_vast_endpoint(VAST_HIGGS_ENDPOINT)
+    req = client.queue_endpoint_request(
+        endpoint=endpoint,
+        worker_route="/generate_stream",
+        worker_payload=payload,
+        timeout=120.0,
+        worker_timeout=60.0,
+    )
+    result = await asyncio.wrap_future(req)
+    resp = result.get("response", {})
+    # Higgs returns base64-encoded audio when called via JSON route
+    audio_b64 = resp.get("audio_b64") if isinstance(resp, dict) else None
+    if audio_b64:
+        return base64.b64decode(audio_b64)
+    return b""
+
+
 SAMPLE_RATE = 16000
 VAD_THRESHOLD = 1800 # Adjusted sensitivity based on user feedback
 SILENCE_DURATION = 0.8  # Stability over extreme speed
@@ -258,84 +323,86 @@ async def process_audio(audio_buffer: bytes, websocket: WebSocket, session_state
     # 1. ASR - Canary
     text = ""
     try:
-        wav_buffer = create_wav_buffer(audio_buffer)
-        data = aiohttp.FormData()
-        data.add_field('file', wav_buffer, filename='input.wav', content_type='audio/wav')
+        if USE_VAST:
+            result = await vast_transcribe(audio_buffer)
+        else:
+            wav_buffer = create_wav_buffer(audio_buffer)
+            data = aiohttp.FormData()
+            data.add_field('file', wav_buffer, filename='input.wav', content_type='audio/wav')
+            # Increase timeout to 30s for the larger v2 model's first few requests
+            async with session.post(CANARY_URL, data=data, timeout=30) as resp:
+                if resp.status != 200:
+                    await safe_send_text(websocket, {"state": "error", "message": f"ASR Error: {resp.status}"})
+                    return
+                result = await resp.json()
+        text = result.get("text", "").strip()
+        score = result.get("score", 0.0)
+        logger.info(f"Canary Transcript: '{text}' (Score: {score})")
+
+        # Voice Command Logic
+        text_lower = text.lower()
+        # Broaden trigger list to handle common ASR mis-transcriptions
+        clone_cmds = [
+            "clone my voice", "speak like me", "copy my voice", 
+            "switch to my voice", "speak in my voice", "learn my voice",
+            "close my voice", "cloud my voice", "clone voice", "clown my voice"
+        ]
+        reset_cmds = ["reset voice", "normal voice", "stop copying", "your voice", "system voice"]
+        is_clone_cmd = any(cmd in text_lower for cmd in clone_cmds)
+        is_reset_cmd = any(cmd in text_lower for cmd in reset_cmds)
+        is_command = is_clone_cmd or is_reset_cmd
         
-        # Increase timeout to 30s for the larger v2 model's first few requests
-        async with session.post(CANARY_URL, data=data, timeout=30) as resp:
-            if resp.status != 200:
-                await safe_send_text(websocket, {"state": "error", "message": f"ASR Error: {resp.status}"})
-                return
-            result = await resp.json()
-            text = result.get("text", "").strip()
-            score = result.get("score", 0.0)
-            logger.info(f"Canary Transcript: '{text}' (Score: {score})")
+        # Save the transcript for voice cloning reference
+        if text and len(text.split()) >= 3 and not is_command:
+            session_state["best_user_text"] = text
+            if "current_audio_chunk" in session_state:
+                session_state["best_user_audio"] = session_state["current_audio_chunk"]
+                logger.info(f"Saved new voice reference: '{text}' at {session_state['best_user_audio']}")
+        
+        if is_clone_cmd:
+            if "best_user_audio" in session_state:
+                session_state["voice_mode"] = "user"
+                logger.info("Switched to User Voice Mode")
+                logger.info(f"Active Clone Reference: '{session_state.get('best_user_text')}'")
+            else:
+                logger.warning("User requested clone, but NO reference audio yet.")
+                session_state["voice_mode"] = "system" 
+        elif is_reset_cmd:
+            session_state["voice_mode"] = "system"
+            logger.info("Switching to System Voice Mode")
             
-            # Voice Command Logic
-            text_lower = text.lower()
-            # Broaden trigger list to handle common ASR mis-transcriptions
-            clone_cmds = [
-                "clone my voice", "speak like me", "copy my voice", 
-                "switch to my voice", "speak in my voice", "learn my voice",
-                "close my voice", "cloud my voice", "clone voice", "clown my voice"
-            ]
-            reset_cmds = ["reset voice", "normal voice", "stop copying", "your voice", "system voice"]
-            is_clone_cmd = any(cmd in text_lower for cmd in clone_cmds)
-            is_reset_cmd = any(cmd in text_lower for cmd in reset_cmds)
-            is_command = is_clone_cmd or is_reset_cmd
+        # Confidence threshold check
+        CONFIDENCE_THRESHOLD = -1.0 
             
-            # Save the transcript for voice cloning reference
-            if text and len(text.split()) >= 3 and not is_command:
-                session_state["best_user_text"] = text
-                if "current_audio_chunk" in session_state:
-                    session_state["best_user_audio"] = session_state["current_audio_chunk"]
-                    logger.info(f"Saved new voice reference: '{text}' at {session_state['best_user_audio']}")
-            
-            if is_clone_cmd:
-                if "best_user_audio" in session_state:
-                    session_state["voice_mode"] = "user"
-                    logger.info("Switched to User Voice Mode")
-                    logger.info(f"Active Clone Reference: '{session_state.get('best_user_text')}'")
-                else:
-                    logger.warning("User requested clone, but NO reference audio yet.")
-                    # We'll let the LLM handle the explanation via the system prompt update
-                    # But we stay in system mode for now.
-                    session_state["voice_mode"] = "system" 
-            elif is_reset_cmd:
-                session_state["voice_mode"] = "system"
-                logger.info("Switching to System Voice Mode")
-                
-            # Confidence threshold check
-            # Canary scores are log-probs; 0.0 is perfect, lower is worse.
-            # A threshold of -1.0 is roughly "some uncertainty"
-            CONFIDENCE_THRESHOLD = -1.0 
-                
-            if score < CONFIDENCE_THRESHOLD and len(text.split()) > 2:
-                logger.warning(f"Low ASR confidence ({score}). Triggering rephrase.")
-                text = "I'm sorry, I didn't hear you clearly. Could you please repeat what you said?"
-                # We skip Groq and go straight to TTS with this message
-                await safe_send_text(websocket, {"state": "transcribed", "text": "[Low confidence] " + text})
-                await safe_send_text(websocket, {"state": "processing", "message": "Asking to repeat..."})
-                
+        if score < CONFIDENCE_THRESHOLD and len(text.split()) > 2:
+            logger.warning(f"Low ASR confidence ({score}). Triggering rephrase.")
+            text = "I'm sorry, I didn't hear you clearly. Could you please repeat what you said?"
+            await safe_send_text(websocket, {"state": "transcribed", "text": "[Low confidence] " + text})
+            await safe_send_text(websocket, {"state": "processing", "message": "Asking to repeat..."})
+
+            if USE_VAST:
+                audio_data = await vast_tts({"text": text})
+                if audio_data:
+                    await safe_send_bytes(websocket, audio_data)
+            else:
                 async with session.post(HIGGS_URL, json={"text": text}, timeout=aiohttp.ClientTimeout(total=30)) as tts_resp:
                     if tts_resp.status == 200:
                         async for chunk in tts_resp.content.iter_any():
                             if chunk: await safe_send_bytes(websocket, chunk)
-                
-                await safe_send_text(websocket, {"state": "idle", "message": "Listening..."})
-                return
 
-            # Filter short hallucinations but allow clear short words if score is high
-            valid_shorts = ["hi", "no", "yes", "hey", "ok", "bye"]
-            if not text or (len(text) < 3 and text.lower() not in valid_shorts):
-                await safe_send_text(websocket, {"state": "idle", "message": "No clear speech detected."})
-                return
-            
-            # Additional score check for very short inputs to avoid noise-hallucinations
-            if len(text.split()) == 1 and score < -0.5:
-                 await safe_send_text(websocket, {"state": "idle", "message": "Ignored low-confidence noise."})
-                 return
+            await safe_send_text(websocket, {"state": "idle", "message": "Listening..."})
+            return
+
+        # Filter short hallucinations but allow clear short words if score is high
+        valid_shorts = ["hi", "no", "yes", "hey", "ok", "bye"]
+        if not text or (len(text) < 3 and text.lower() not in valid_shorts):
+            await safe_send_text(websocket, {"state": "idle", "message": "No clear speech detected."})
+            return
+        
+        # Additional score check for very short inputs to avoid noise-hallucinations
+        if len(text.split()) == 1 and score < -0.5:
+            await safe_send_text(websocket, {"state": "idle", "message": "Ignored low-confidence noise."})
+            return
 
     except Exception as e:
         logger.error(f"ASR Exception: {e}")
@@ -371,15 +438,21 @@ async def process_audio(audio_buffer: bytes, websocket: WebSocket, session_state
                     if session_state.get("best_user_text"):
                         tts_payload["ref_text"] = session_state["best_user_text"]
                 
-                async with session.post(HIGGS_URL, json=tts_payload, timeout=aiohttp.ClientTimeout(total=30)) as resp:
-                    if resp.status == 200:
-                        # Stream the audio chunks from Higgs
-                        async for chunk in resp.content.iter_any():
-                            if chunk:
-                                await safe_send_bytes(websocket, chunk)
-                        logger.info(f"Finished relaying Higgs stream for sentence: {sentence[:20]}...")
-                    else:
-                        logger.error(f"Higgs failed for sentence: {resp.status}")
+                if USE_VAST:
+                    audio_data = await vast_tts(tts_payload)
+                    if audio_data:
+                        await safe_send_bytes(websocket, audio_data)
+                    logger.info(f"Finished Vast TTS for sentence: {sentence[:20]}...")
+                else:
+                    async with session.post(HIGGS_URL, json=tts_payload, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                        if resp.status == 200:
+                            # Stream the audio chunks from Higgs
+                            async for chunk in resp.content.iter_any():
+                                if chunk:
+                                    await safe_send_bytes(websocket, chunk)
+                            logger.info(f"Finished relaying Higgs stream for sentence: {sentence[:20]}...")
+                        else:
+                            logger.error(f"Higgs failed for sentence: {resp.status}")
             except Exception as e:
                 logger.error(f"TTS sentence exception: {e}")
 

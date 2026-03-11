@@ -1,10 +1,12 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 import nemo.collections.asr as nemo_asr
 import torch
 import os
 import shutil
 import tempfile
+import base64
 
 app = FastAPI()
 
@@ -84,6 +86,34 @@ async def transcribe(file: UploadFile = File(...)):
         import traceback
         traceback.print_exc()
         print(f"Transcription error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+
+class TranscribeRequest(BaseModel):
+    audio_b64: str  # base64-encoded WAV bytes
+
+@app.post("/transcribe_b64")
+async def transcribe_b64(req: TranscribeRequest):
+    """JSON endpoint for Vast.ai serverless — receives base64-encoded WAV."""
+    if asr_model is None:
+        raise HTTPException(status_code=503, detail="Model not loaded")
+    audio_bytes = base64.b64decode(req.audio_b64)
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
+        tmp.write(audio_bytes)
+        tmp_path = tmp.name
+    try:
+        results = asr_model.transcribe([tmp_path], return_hypotheses=True)
+        text, score = "", 0.0
+        if results:
+            hyp = results[0]
+            if isinstance(hyp, list):
+                hyp = hyp[0]
+            text = hyp.text
+            score = float(getattr(hyp, "score", 0.0))
+        return {"text": text, "score": score}
+    except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         if os.path.exists(tmp_path):

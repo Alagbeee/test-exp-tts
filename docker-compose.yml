@@ -8,9 +8,6 @@ services:
       - "8000:8000"
     environment:
       - HF_TOKEN=${HF_TOKEN}
-      - HIGGS_AUDIO_ROOT=/workspace/higgs-audio
-    volumes:
-      - ./higgs-audio:/workspace/higgs-audio
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=5).read()"]
       interval: 15s
@@ -59,6 +56,10 @@ services:
       - GROQ_API_KEY=${GROQ_API_KEY}
       - CANARY_URL=http://canary-service:8001/transcribe
       - HIGGS_URL=http://higgs-service:8000/generate_stream
+      # Vast.ai serverless (optional — leave blank to use local containers)
+      - VAST_API_KEY=${VAST_API_KEY:-}
+      - VAST_CANARY_ENDPOINT=${VAST_CANARY_ENDPOINT:-}
+      - VAST_HIGGS_ENDPOINT=${VAST_HIGGS_ENDPOINT:-}
     depends_on:
       higgs-service:
         condition: service_healthy

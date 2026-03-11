@@ -4,7 +4,7 @@ WORKDIR /app
 
 ENV PYTHONUNBUFFERED=1
 
-RUN pip install --no-cache-dir fastapi 'uvicorn[standard]' aiohttp numpy
+RUN pip install --no-cache-dir fastapi 'uvicorn[standard]' aiohttp numpy vastai-sdk
 
 COPY s2s_server.py /app/s2s_server.py
 COPY s2s_frontend /app/s2s_frontend

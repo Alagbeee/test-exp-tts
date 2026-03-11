@@ -9,7 +9,7 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 # Install python dependencies for API
-RUN pip install fastapi uvicorn python-multipart
+RUN pip install fastapi uvicorn python-multipart vastai-sdk
 
 # Copy local Higgs Audio repo (we will mount it or copy it, mounting is better for dev but copying is safer for build context if repo is outside)
 # Since we cloned it to /workspace/exp/higgs-audio, and this dockerfile is inside /workspace/exp/higgs/Dockerfile, 
@@ -26,6 +26,9 @@ RUN pip install -e .
 
 # Copy server script outside the bind-mounted repo path so the container keeps it at runtime.
 COPY higgs/server.py /workspace/server.py
+COPY higgs/worker.py /workspace/worker.py
+COPY higgs/start.sh /workspace/start.sh
+RUN chmod +x /workspace/start.sh
 
 # Bake model weights into the image at build time for instant cold starts.
 # Pass --build-arg HF_TOKEN=xxx if the repos require authentication.
@@ -37,4 +40,6 @@ RUN python3 /tmp/download_models.py
 ENV HIGGS_MODEL_PATH=/models/higgs
 ENV HIGGS_TOKENIZER_PATH=/models/higgs-tokenizer
 
+# Default: plain uvicorn (for docker-compose / local use).
+# On Vast.ai serverless, override CMD to ["/workspace/start.sh"] in the template.
 CMD ["uvicorn", "--app-dir", "/workspace", "server:app", "--host", "0.0.0.0", "--port", "8000"]

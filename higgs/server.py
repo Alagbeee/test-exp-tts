@@ -327,3 +327,8 @@ async def generate_audio_stream(req: GenerateRequest):
                 yield audio_int16.tobytes()
 
     return StreamingResponse(audio_generator(), media_type="application/octet-stream")
+
+# Alias used by docker-compose and s2s_server
+@app.post("/generate_stream")
+def generate_stream(req: GenerateRequest):
+    return generate_audio(req)
