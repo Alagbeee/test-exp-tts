@@ -1,3 +1,4 @@
+import base64
 from fastapi import FastAPI, HTTPException, Body
 from fastapi.responses import Response, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -157,6 +158,12 @@ def generate_audio(req: GenerateRequest):
     except Exception as e:
         print(f"Generation error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/generate_b64")
+def generate_audio_b64(req: GenerateRequest):
+    response = generate_audio(req)
+    return {"audio_b64": base64.b64encode(response.body).decode()}
+
 @app.post("/generate_stream")
 async def generate_audio_stream(req: GenerateRequest):
     if serve_engine is None:

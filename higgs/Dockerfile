@@ -24,18 +24,18 @@ RUN pip install -r requirements.txt
 RUN pip uninstall -y flash-attn || true
 RUN pip install -e .
 
-# Copy server script outside the bind-mounted repo path so the container keeps it at runtime.
-COPY higgs/server.py /workspace/server.py
-COPY higgs/worker.py /workspace/worker.py
-COPY higgs/start.sh /workspace/start.sh
-RUN chmod +x /workspace/start.sh
-
 # Bake model weights into the image at build time for instant cold starts.
 # Pass --build-arg HF_TOKEN=xxx if the repos require authentication.
 ARG HF_TOKEN=""
 ENV HF_TOKEN=${HF_TOKEN}
 COPY higgs/download_models.py /tmp/download_models.py
 RUN python3 /tmp/download_models.py
+
+# Copy server files after the baked model layer so code-only changes do not force a re-download.
+COPY higgs/server.py /workspace/server.py
+COPY higgs/worker.py /workspace/worker.py
+COPY higgs/start.sh /workspace/start.sh
+RUN chmod +x /workspace/start.sh
 
 ENV HIGGS_MODEL_PATH=/models/higgs
 ENV HIGGS_TOKENIZER_PATH=/models/higgs-tokenizer

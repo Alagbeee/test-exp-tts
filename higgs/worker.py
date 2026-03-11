@@ -10,7 +10,7 @@ worker_config = WorkerConfig(
     model_log_file="/var/log/higgs/server.log",
     handlers=[
         HandlerConfig(
-            route="/generate_stream",
+            route="/generate_b64",
             allow_parallel_requests=False,  # Higgs is stateful / single-GPU
             max_queue_time=120.0,
             workload_calculator=lambda payload: 100.0,
