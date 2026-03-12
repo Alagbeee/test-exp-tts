@@ -27,6 +27,9 @@ RUN pip install -e .
 # Model weights are downloaded at first startup (in start.sh) so the build
 # succeeds on low-RAM CI/build machines. On Vast.ai the GPU worker has plenty
 # of RAM and fast egress to HuggingFace.
+# hf_transfer enables multi-connection downloads for 5-10x speed.
+RUN pip install hf_transfer
+ENV HF_HUB_ENABLE_HF_TRANSFER=1
 ARG HF_TOKEN=""
 ENV HF_TOKEN=${HF_TOKEN}
 COPY higgs/download_models.py /workspace/download_models.py

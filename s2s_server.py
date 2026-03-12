@@ -87,7 +87,7 @@ async def vast_transcribe(audio_buffer: bytes) -> dict:
         endpoint=endpoint,
         worker_route="/transcribe_b64",
         worker_payload={"audio_b64": wav_b64},
-        max_wait_time=60.0,
+        timeout=60.0,
     )
     result = await asyncio.wrap_future(req)
     return result.get("response", {})
@@ -100,7 +100,7 @@ async def vast_tts(payload: dict) -> bytes:
         endpoint=endpoint,
         worker_route="/generate_b64",
         worker_payload=payload,
-        max_wait_time=120.0,
+        timeout=120.0,
     )
     result = await asyncio.wrap_future(req)
     resp = result.get("response", {})

@@ -12,6 +12,8 @@ if [ ! -d "/models/canary" ] || [ -z "$(ls -A /models/canary 2>/dev/null)" ]; th
   python3 /workspace/download_models.py
 fi
 
+export CANARY_MODEL_PATH=/models/canary
+
 uvicorn --app-dir /workspace server:app --host 0.0.0.0 --port 8001 \
   2>&1 | tee /var/log/canary/server.log &
 

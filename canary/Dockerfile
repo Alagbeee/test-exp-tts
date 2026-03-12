@@ -7,7 +7,9 @@ RUN pip install fastapi uvicorn python-multipart "vastai-sdk>=0.5.1"
 
 # Model weights are downloaded at first startup (in start.sh) on the Vast.ai
 # GPU worker, which has ample RAM and fast egress to HuggingFace.
-RUN pip install huggingface_hub
+# hf_transfer enables multi-connection downloads for 5-10x speed.
+RUN pip install huggingface_hub hf_transfer
+ENV HF_HUB_ENABLE_HF_TRANSFER=1
 COPY canary/download_models.py /workspace/download_models.py
 
 # Copy server files
