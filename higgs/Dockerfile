@@ -9,7 +9,7 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 # Install python dependencies for API
-RUN pip install fastapi uvicorn python-multipart vastai-sdk
+RUN pip install fastapi uvicorn python-multipart "vastai-sdk>=0.5.1"
 
 # Copy local Higgs Audio repo (we will mount it or copy it, mounting is better for dev but copying is safer for build context if repo is outside)
 # Since we cloned it to /workspace/exp/higgs-audio, and this dockerfile is inside /workspace/exp/higgs/Dockerfile, 
@@ -24,14 +24,14 @@ RUN pip install -r requirements.txt
 RUN pip uninstall -y flash-attn || true
 RUN pip install -e .
 
-# Bake model weights into the image at build time for instant cold starts.
-# Pass --build-arg HF_TOKEN=xxx if the repos require authentication.
+# Model weights are downloaded at first startup (in start.sh) so the build
+# succeeds on low-RAM CI/build machines. On Vast.ai the GPU worker has plenty
+# of RAM and fast egress to HuggingFace.
 ARG HF_TOKEN=""
 ENV HF_TOKEN=${HF_TOKEN}
-COPY higgs/download_models.py /tmp/download_models.py
-RUN python3 /tmp/download_models.py
+COPY higgs/download_models.py /workspace/download_models.py
 
-# Copy server files after the baked model layer so code-only changes do not force a re-download.
+# Copy server files
 COPY higgs/server.py /workspace/server.py
 COPY higgs/worker.py /workspace/worker.py
 COPY higgs/start.sh /workspace/start.sh
