@@ -10,7 +10,7 @@ export CANARY_MODEL_PATH=/models/canary
 export PYTHONUNBUFFERED=1
 
 uvicorn --app-dir /workspace server:app --host 0.0.0.0 --port 8001 \
-  2>&1 | tee /var/log/canary/server.log &
+  > /var/log/canary/server.log 2>&1 &
 
 echo "Waiting for model server to start..."
 until python3 - <<'PY'

@@ -11,7 +11,7 @@ export HIGGS_TOKENIZER_PATH=/models/higgs-tokenizer
 export PYTHONUNBUFFERED=1
 
 uvicorn --app-dir /workspace server:app --host 0.0.0.0 --port 8000 \
-  2>&1 | tee /var/log/higgs/server.log &
+  > /var/log/higgs/server.log 2>&1 &
 
 # Wait for uvicorn to start accepting connections
 echo "Waiting for model server to start..."
