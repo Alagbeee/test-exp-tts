@@ -6,12 +6,6 @@
 
 mkdir -p /var/log/higgs
 
-# Download models on first start (skipped if weights already exist)
-if [ ! -d "/models/higgs" ] || [ -z "$(ls -A /models/higgs 2>/dev/null)" ]; then
-  echo "Downloading model weights..."
-  python3 /workspace/download_models.py
-fi
-
 export HIGGS_MODEL_PATH=/models/higgs
 export HIGGS_TOKENIZER_PATH=/models/higgs-tokenizer
 export PYTHONUNBUFFERED=1

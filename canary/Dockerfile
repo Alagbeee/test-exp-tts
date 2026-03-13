@@ -5,12 +5,11 @@ WORKDIR /workspace/nemo-canary
 # Install API dependencies
 RUN pip install fastapi uvicorn python-multipart "vastai-sdk>=0.5.1"
 
-# Model weights are downloaded at first startup (in start.sh) on the Vast.ai
-# GPU worker, which has ample RAM and fast egress to HuggingFace.
-# hf_transfer enables multi-connection downloads for 5-10x speed.
+# Download model weights at build time so cold starts are fast.
 RUN pip install huggingface_hub hf_transfer
 ENV HF_HUB_ENABLE_HF_TRANSFER=1
 COPY canary/download_models.py /workspace/download_models.py
+RUN python3 /workspace/download_models.py
 
 # Copy server files
 COPY canary/server.py /workspace/server.py

@@ -6,12 +6,6 @@
 
 mkdir -p /var/log/canary
 
-# Download models on first start (skipped if weights already exist)
-if [ ! -d "/models/canary" ] || [ -z "$(ls -A /models/canary 2>/dev/null)" ]; then
-  echo "Downloading model weights..."
-  python3 /workspace/download_models.py
-fi
-
 export CANARY_MODEL_PATH=/models/canary
 export PYTHONUNBUFFERED=1
 
