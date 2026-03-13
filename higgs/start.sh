@@ -14,6 +14,7 @@ fi
 
 export HIGGS_MODEL_PATH=/models/higgs
 export HIGGS_TOKENIZER_PATH=/models/higgs-tokenizer
+export PYTHONUNBUFFERED=1
 
 uvicorn --app-dir /workspace server:app --host 0.0.0.0 --port 8000 \
   2>&1 | tee /var/log/higgs/server.log &
