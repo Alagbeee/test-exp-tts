@@ -18,6 +18,7 @@ COPY canary/start.sh /workspace/start.sh
 RUN chmod +x /workspace/start.sh
 
 ENV CANARY_MODEL_PATH=/models/canary
+ENV WORKER_PORT=70703
 
 # start.sh starts the model server, waits for readiness, then launches
 # the Vast.ai PyWorker (which handles serverless request routing).

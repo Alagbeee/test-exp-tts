@@ -40,6 +40,7 @@ RUN chmod +x /workspace/start.sh
 
 ENV HIGGS_MODEL_PATH=/models/higgs
 ENV HIGGS_TOKENIZER_PATH=/models/higgs-tokenizer
+ENV WORKER_PORT=70703
 
 # start.sh starts the model server, waits for readiness, then launches
 # the Vast.ai PyWorker (which handles serverless request routing).
