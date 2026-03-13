@@ -19,6 +19,6 @@ RUN chmod +x /workspace/start.sh
 
 ENV CANARY_MODEL_PATH=/models/canary
 
-# Default: plain uvicorn (for docker-compose / local use).
-# On Vast.ai serverless, override CMD to ["/workspace/start.sh"] in the template.
-CMD ["uvicorn", "--app-dir", "/workspace", "server:app", "--host", "0.0.0.0", "--port", "8001"]
+# start.sh starts the model server, waits for readiness, then launches
+# the Vast.ai PyWorker (which handles serverless request routing).
+CMD ["/workspace/start.sh"]
