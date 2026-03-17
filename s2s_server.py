@@ -48,67 +48,15 @@ GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_MODEL = "llama-3.1-8b-instant"
 
-# Vast.ai Serverless configuration (optional — set these to route ASR/TTS through Vast)
-VAST_API_KEY = os.environ.get("VAST_API_KEY")
-VAST_CANARY_ENDPOINT = os.environ.get("VAST_CANARY_ENDPOINT")  # e.g. "canary-asr"
-VAST_HIGGS_ENDPOINT = os.environ.get("VAST_HIGGS_ENDPOINT")    # e.g. "higgs-tts"
-USE_VAST = bool(VAST_API_KEY and VAST_CANARY_ENDPOINT and VAST_HIGGS_ENDPOINT)
+# RunPod API key — set this when using RunPod load-balancing endpoints.
+# Leave unset for local dev (no auth header will be added).
+RUNPOD_API_KEY = os.environ.get("RUNPOD_API_KEY")
 
-_vast_client = None
-_vast_endpoints: dict = {}
-
-async def get_vast_client():
-    global _vast_client
-    if _vast_client is None:
-        from vastai import Serverless
-        _vast_client = Serverless(VAST_API_KEY)
-    return _vast_client
-
-async def get_vast_endpoint(name: str):
-    if name not in _vast_endpoints:
-        client = await get_vast_client()
-        _vast_endpoints[name] = await client.get_endpoint(name)
-    return _vast_endpoints[name]
-
-async def vast_transcribe(audio_buffer: bytes) -> dict:
-    """Send audio to Canary on Vast.ai and return {text, score}."""
-    client = await get_vast_client()
-    endpoint = await get_vast_endpoint(VAST_CANARY_ENDPOINT)
-    audio_b64 = base64.b64encode(audio_buffer).decode()
-    # create_wav_buffer is defined below; we need raw WAV bytes here
-    wav_io = io.BytesIO()
-    with wave.open(wav_io, 'wb') as wf:
-        wf.setnchannels(1)
-        wf.setsampwidth(2)
-        wf.setframerate(SAMPLE_RATE)
-        wf.writeframes(audio_buffer)
-    wav_b64 = base64.b64encode(wav_io.getvalue()).decode()
-    req = client.queue_endpoint_request(
-        endpoint=endpoint,
-        worker_route="/transcribe_b64",
-        worker_payload={"audio_b64": wav_b64},
-        timeout=60.0,
-    )
-    result = await asyncio.wrap_future(req)
-    return result.get("response", {})
-
-async def vast_tts(payload: dict) -> bytes:
-    """Send TTS request to Higgs on Vast.ai, return raw PCM bytes."""
-    client = await get_vast_client()
-    endpoint = await get_vast_endpoint(VAST_HIGGS_ENDPOINT)
-    req = client.queue_endpoint_request(
-        endpoint=endpoint,
-        worker_route="/generate_b64",
-        worker_payload=payload,
-        timeout=120.0,
-    )
-    result = await asyncio.wrap_future(req)
-    resp = result.get("response", {})
-    # Higgs returns base64-encoded audio when called via JSON route
-    audio_b64 = resp.get("audio_b64") if isinstance(resp, dict) else None
-    if audio_b64:
-        return base64.b64decode(audio_b64)
-    return b""
+def _runpod_headers() -> dict:
+    """Return Authorization header for RunPod endpoints, empty dict for local."""
+    if RUNPOD_API_KEY:
+        return {"Authorization": f"Bearer {RUNPOD_API_KEY}"}
+    return {}
 
 
 SAMPLE_RATE = 16000
@@ -321,18 +269,15 @@ async def process_audio(audio_buffer: bytes, websocket: WebSocket, session_state
     # 1. ASR - Canary
     text = ""
     try:
-        if USE_VAST:
-            result = await vast_transcribe(audio_buffer)
-        else:
-            wav_buffer = create_wav_buffer(audio_buffer)
-            data = aiohttp.FormData()
-            data.add_field('file', wav_buffer, filename='input.wav', content_type='audio/wav')
-            # Increase timeout to 30s for the larger v2 model's first few requests
-            async with session.post(CANARY_URL, data=data, timeout=30) as resp:
-                if resp.status != 200:
-                    await safe_send_text(websocket, {"state": "error", "message": f"ASR Error: {resp.status}"})
-                    return
-                result = await resp.json()
+        wav_buffer = create_wav_buffer(audio_buffer)
+        data = aiohttp.FormData()
+        data.add_field('file', wav_buffer, filename='input.wav', content_type='audio/wav')
+        # Increase timeout to 30s for the larger v2 model's first few requests
+        async with session.post(CANARY_URL, data=data, headers=_runpod_headers(), timeout=30) as resp:
+            if resp.status != 200:
+                await safe_send_text(websocket, {"state": "error", "message": f"ASR Error: {resp.status}"})
+                return
+            result = await resp.json()
         text = result.get("text", "").strip()
         score = result.get("score", 0.0)
         logger.info(f"Canary Transcript: '{text}' (Score: {score})")
@@ -378,15 +323,10 @@ async def process_audio(audio_buffer: bytes, websocket: WebSocket, session_state
             await safe_send_text(websocket, {"state": "transcribed", "text": "[Low confidence] " + text})
             await safe_send_text(websocket, {"state": "processing", "message": "Asking to repeat..."})
 
-            if USE_VAST:
-                audio_data = await vast_tts({"text": text})
-                if audio_data:
-                    await safe_send_bytes(websocket, audio_data)
-            else:
-                async with session.post(HIGGS_URL, json={"text": text}, timeout=aiohttp.ClientTimeout(total=30)) as tts_resp:
-                    if tts_resp.status == 200:
-                        async for chunk in tts_resp.content.iter_any():
-                            if chunk: await safe_send_bytes(websocket, chunk)
+            async with session.post(HIGGS_URL, json={"text": text}, headers=_runpod_headers(), timeout=aiohttp.ClientTimeout(total=30)) as tts_resp:
+                if tts_resp.status == 200:
+                    async for chunk in tts_resp.content.iter_any():
+                        if chunk: await safe_send_bytes(websocket, chunk)
 
             await safe_send_text(websocket, {"state": "idle", "message": "Listening..."})
             return
@@ -436,21 +376,15 @@ async def process_audio(audio_buffer: bytes, websocket: WebSocket, session_state
                     if session_state.get("best_user_text"):
                         tts_payload["ref_text"] = session_state["best_user_text"]
                 
-                if USE_VAST:
-                    audio_data = await vast_tts(tts_payload)
-                    if audio_data:
-                        await safe_send_bytes(websocket, audio_data)
-                    logger.info(f"Finished Vast TTS for sentence: {sentence[:20]}...")
-                else:
-                    async with session.post(HIGGS_URL, json=tts_payload, timeout=aiohttp.ClientTimeout(total=30)) as resp:
-                        if resp.status == 200:
-                            # Stream the audio chunks from Higgs
-                            async for chunk in resp.content.iter_any():
-                                if chunk:
-                                    await safe_send_bytes(websocket, chunk)
-                            logger.info(f"Finished relaying Higgs stream for sentence: {sentence[:20]}...")
-                        else:
-                            logger.error(f"Higgs failed for sentence: {resp.status}")
+                async with session.post(HIGGS_URL, json=tts_payload, headers=_runpod_headers(), timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                    if resp.status == 200:
+                        # Stream the audio chunks from Higgs
+                        async for chunk in resp.content.iter_any():
+                            if chunk:
+                                await safe_send_bytes(websocket, chunk)
+                        logger.info(f"Finished relaying Higgs stream for sentence: {sentence[:20]}...")
+                    else:
+                        logger.error(f"Higgs failed for sentence: {resp.status}")
             except Exception as e:
                 logger.error(f"TTS sentence exception: {e}")
 

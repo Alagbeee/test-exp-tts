@@ -1,4 +1,6 @@
 import base64
+import threading
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Body
 from fastapi.responses import Response, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -9,10 +11,8 @@ import torch
 import time
 import io
 import sys
-import torch
 import torchaudio
 import soundfile as sf
-from fastapi import FastAPI, Response, HTTPException
 
 APP_ROOT = Path(__file__).resolve().parent
 HIGGS_AUDIO_ROOT = Path(os.environ.get("HIGGS_AUDIO_ROOT", APP_ROOT / "higgs-audio"))
@@ -26,7 +26,35 @@ from boson_multimodal.serve.serve_engine import HiggsAudioServeEngine, HiggsAudi
 from boson_multimodal.data_types import ChatMLSample, Message, AudioContent
 from boson_multimodal.model.higgs_audio.utils import revert_delay_pattern
 
-app = FastAPI()
+# Configuration
+MODEL_PATH = os.environ.get("HIGGS_MODEL_PATH", "bosonai/higgs-audio-v2-generation-3B-base")
+AUDIO_TOKENIZER_PATH = os.environ.get("HIGGS_TOKENIZER_PATH", "bosonai/higgs-audio-v2-tokenizer")
+DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
+SAMPLE_RATE = 24000
+
+# Model state — loaded in background thread so /ping can respond during startup
+serve_engine = None
+_model_loading = True
+
+def _load_model():
+    global serve_engine, _model_loading
+    print(f"Loading Higgs model on {DEVICE}...")
+    try:
+        serve_engine = HiggsAudioServeEngine(MODEL_PATH, AUDIO_TOKENIZER_PATH, device=DEVICE)
+        print("Higgs model loaded successfully.")
+    except Exception as e:
+        print(f"Error loading model: {e}")
+        serve_engine = None
+    finally:
+        _model_loading = False
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    thread = threading.Thread(target=_load_model, daemon=True)
+    thread.start()
+    yield
+
+app = FastAPI(lifespan=lifespan)
 
 # Enable CORS
 app.add_middleware(
@@ -37,29 +65,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Configuration
-MODEL_PATH = os.environ.get("HIGGS_MODEL_PATH", "bosonai/higgs-audio-v2-generation-3B-base")
-AUDIO_TOKENIZER_PATH = os.environ.get("HIGGS_TOKENIZER_PATH", "bosonai/higgs-audio-v2-tokenizer")
-# Force GPU 0 if available, else CPU (though Higgs needs GPU)
-DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
-SAMPLE_RATE = 24000
-
 def create_wav_chunk(audio_data: np.ndarray, sample_rate: int) -> bytes:
     buffer = io.BytesIO()
-    # Safe clipping to avoid distortion
     audio_clipped = np.clip(audio_data, -1.0, 1.0)
     audio_int16 = (audio_clipped * 32767).astype(np.int16)
     sf.write(buffer, audio_int16, sample_rate, format='WAV')
     return buffer.getvalue()
-
-print(f"Loading model on {DEVICE}...")
-try:
-    serve_engine = HiggsAudioServeEngine(MODEL_PATH, AUDIO_TOKENIZER_PATH, device=DEVICE)
-    print("Model loaded successfully.")
-except Exception as e:
-    print(f"Error loading model: {e}")
-    # We don't exit here so the container stays alive for debugging if needed, but the endpoint will fail
-    serve_engine = None
 
 class GenerateRequest(BaseModel):
     text: str
@@ -70,6 +81,15 @@ class GenerateRequest(BaseModel):
     ref_audio_path: str = None
     ref_audio_base64: str = None
     ref_text: str = None
+
+@app.get("/ping")
+def ping():
+    """RunPod load-balancing health check. 204=initializing, 200=healthy."""
+    if _model_loading:
+        return Response(status_code=204)
+    if serve_engine is None:
+        raise HTTPException(status_code=503, detail="Model failed to load")
+    return {"status": "healthy"}
 
 @app.get("/health")
 def health():

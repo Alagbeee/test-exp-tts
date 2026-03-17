@@ -1,5 +1,8 @@
+from contextlib import asynccontextmanager
+import threading
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response
 from pydantic import BaseModel
 import nemo.collections.asr as nemo_asr
 import torch
@@ -8,7 +11,48 @@ import shutil
 import tempfile
 import base64
 
-app = FastAPI()
+# Configuration
+# options: nvidia/canary-1b, nvidia/canary-1b-v2
+MODEL_NAME = "nvidia/canary-1b-v2"
+# Force GPU 1
+DEVICE = "cuda:1" if torch.cuda.device_count() > 1 else "cuda:0" if torch.cuda.is_available() else "cpu"
+
+CANARY_MODEL_PATH = os.environ.get("CANARY_MODEL_PATH", None)
+
+# Model state — loaded in background thread so /ping can respond during startup
+asr_model = None
+_model_loading = True
+
+def _load_model():
+    global asr_model, _model_loading
+    print(f"Loading Canary model on {DEVICE}...")
+    try:
+        if CANARY_MODEL_PATH:
+            import glob
+            nemo_files = glob.glob(os.path.join(CANARY_MODEL_PATH, "*.nemo"))
+            if nemo_files:
+                print(f"Loading from baked-in weights: {nemo_files[0]}")
+                model = nemo_asr.models.EncDecMultiTaskModel.restore_from(nemo_files[0])
+            else:
+                print(f"No .nemo file found in {CANARY_MODEL_PATH}, falling back to from_pretrained")
+                model = nemo_asr.models.EncDecMultiTaskModel.from_pretrained(model_name=MODEL_NAME)
+        else:
+            model = nemo_asr.models.EncDecMultiTaskModel.from_pretrained(model_name=MODEL_NAME)
+        asr_model = model.to(DEVICE)
+        print("Canary model loaded successfully.")
+    except Exception as e:
+        print(f"Error loading model: {e}")
+        asr_model = None
+    finally:
+        _model_loading = False
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    thread = threading.Thread(target=_load_model, daemon=True)
+    thread.start()
+    yield
+
+app = FastAPI(lifespan=lifespan)
 
 # Enable CORS
 app.add_middleware(
@@ -19,32 +63,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Configuration
-# options: nvidia/canary-1b, nvidia/canary-1b-v2
-MODEL_NAME = "nvidia/canary-1b-v2"
-# Force GPU 1
-DEVICE = "cuda:1" if torch.cuda.device_count() > 1 else "cuda:0" if torch.cuda.is_available() else "cpu"
-
-CANARY_MODEL_PATH = os.environ.get("CANARY_MODEL_PATH", None)
-
-print(f"Loading Canary model on {DEVICE}...")
-try:
-    if CANARY_MODEL_PATH:
-        import glob
-        nemo_files = glob.glob(os.path.join(CANARY_MODEL_PATH, "*.nemo"))
-        if nemo_files:
-            print(f"Loading from baked-in weights: {nemo_files[0]}")
-            asr_model = nemo_asr.models.EncDecMultiTaskModel.restore_from(nemo_files[0])
-        else:
-            print(f"No .nemo file found in {CANARY_MODEL_PATH}, falling back to from_pretrained")
-            asr_model = nemo_asr.models.EncDecMultiTaskModel.from_pretrained(model_name=MODEL_NAME)
-    else:
-        asr_model = nemo_asr.models.EncDecMultiTaskModel.from_pretrained(model_name=MODEL_NAME)
-    asr_model = asr_model.to(DEVICE)
-    print("Canary model loaded successfully.")
-except Exception as e:
-    print(f"Error loading model: {e}")
-    asr_model = None
+@app.get("/ping")
+def ping():
+    """RunPod load-balancing health check. 204=initializing, 200=healthy."""
+    if _model_loading:
+        return Response(status_code=204)
+    if asr_model is None:
+        raise HTTPException(status_code=503, detail="Model failed to load")
+    return {"status": "healthy"}
 
 @app.get("/health")
 def health():

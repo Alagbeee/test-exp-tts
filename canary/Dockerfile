@@ -3,7 +3,7 @@ FROM nvcr.io/nvidia/nemo:25.02
 WORKDIR /workspace/nemo-canary
 
 # Install API dependencies
-RUN pip install fastapi uvicorn python-multipart "vastai-sdk>=0.5.1"
+RUN pip install fastapi uvicorn python-multipart
 
 # Download model weights at build time so cold starts are fast.
 RUN pip install huggingface_hub hf_transfer
