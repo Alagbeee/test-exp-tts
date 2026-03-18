@@ -5,11 +5,7 @@ WORKDIR /workspace/nemo-canary
 # Install API dependencies
 RUN pip install fastapi uvicorn python-multipart
 
-# Download model weights at build time so cold starts are fast.
-RUN pip install huggingface_hub hf_transfer
-ENV HF_HUB_ENABLE_HF_TRANSFER=1
-COPY canary/download_models.py /workspace/download_models.py
-RUN python3 /workspace/download_models.py
+# Models loaded from network volume at /models at runtime
 
 # Copy server files
 COPY canary/server.py /workspace/server.py

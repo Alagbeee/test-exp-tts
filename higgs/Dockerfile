@@ -24,13 +24,7 @@ RUN pip install -r requirements.txt
 RUN pip uninstall -y flash-attn || true
 RUN pip install -e .
 
-# Download model weights at build time so cold starts are fast.
-RUN pip install hf_transfer
-ENV HF_HUB_ENABLE_HF_TRANSFER=1
-ARG HF_TOKEN=""
-ENV HF_TOKEN=${HF_TOKEN}
-COPY higgs/download_models.py /workspace/download_models.py
-RUN python3 /workspace/download_models.py
+# Models loaded from network volume at /models at runtime
 
 # Copy server files
 COPY higgs/server.py /workspace/server.py
