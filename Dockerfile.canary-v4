@@ -1,0 +1,16 @@
+FROM nvcr.io/nvidia/nemo:25.02
+
+WORKDIR /workspace
+
+# Install API dependencies
+RUN pip install --no-cache-dir fastapi uvicorn python-multipart
+
+# Copy server files
+COPY canary/server.py /workspace/server.py
+COPY canary/start.sh /workspace/start.sh
+RUN chmod +x /workspace/start.sh
+
+ENV CANARY_MODEL_PATH=/models/canary
+ENV PYTHONUNBUFFERED=1
+
+CMD ["/workspace/start.sh"]

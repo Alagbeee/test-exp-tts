@@ -1,0 +1,7 @@
+FROM 15wins/higgs:v3
+
+# Bake models into image
+ARG HF_TOKEN
+RUN pip install -q huggingface_hub
+COPY higgs/download_models.py /tmp/download_models.py
+RUN python /tmp/download_models.py
