@@ -43,6 +43,7 @@ async def get():
 # Configuration
 CANARY_URL = os.environ.get("CANARY_URL", "http://127.0.0.1:8001/transcribe")
 HIGGS_URL = os.environ.get("HIGGS_URL", "http://127.0.0.1:8000/generate_stream")
+# /generate_stream on higgs:v5+ yields raw int16 PCM @ 24kHz as-generated (first chunk ~270ms)
 # Groq Configuration
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
@@ -61,8 +62,15 @@ def _runpod_headers() -> dict:
 
 SAMPLE_RATE = 16000
 VAD_THRESHOLD = 1800 # Adjusted sensitivity based on user feedback
-SILENCE_DURATION = 0.8  # Stability over extreme speed
+SILENCE_DURATION = 0.5  # Faster turn-taking
 MIN_AUDIO_DURATION = 0.5 # Minimum audio duration to process
+# Require consecutive high-energy frames before declaring speech to avoid
+# accidental self-interrupts from playback leakage/echo.
+VAD_MIN_SPEECH_FRAMES = 2
+
+# TTS output normalization: emit fixed-size chunks for smooth playback
+# 4800 bytes = 2400 samples @ 24kHz int16 mono = 100ms per chunk
+TTS_CHUNK_SIZE = 4800
 
 class ConnectionManager:
     def __init__(self):
@@ -113,6 +121,53 @@ async def get_session():
     if _global_session is None or _global_session.closed:
         _global_session = aiohttp.ClientSession()
     return _global_session
+
+async def _keepalive_loop():
+    """Send a minimal TTS request every 4 minutes to keep RunPod worker hot in VRAM."""
+    KEEPALIVE_INTERVAL = 240  # seconds
+    WARMUP_TEXT = "Hello."
+    while True:
+        try:
+            session = await get_session()
+            logger.info("TTS keepalive: pinging Higgs worker...")
+            async with session.post(
+                HIGGS_URL,
+                json={"text": WARMUP_TEXT},
+                headers=_runpod_headers(),
+                timeout=aiohttp.ClientTimeout(total=120, sock_read=120),
+            ) as resp:
+                # drain the response so the connection completes properly
+                async for _ in resp.content.iter_any():
+                    pass
+                logger.info(f"TTS keepalive done (status {resp.status})")
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.warning(f"TTS keepalive error (non-fatal): {e}")
+        await asyncio.sleep(KEEPALIVE_INTERVAL)
+
+@app.on_event("startup")
+async def startup_warmup():
+    """Fire & forget: warm the TTS worker ASAP so the first user turn isn't cold."""
+    async def _warmup():
+        await asyncio.sleep(2)  # let uvicorn settle first
+        logger.info("Startup TTS warmup — sending short request to pre-load model into VRAM...")
+        try:
+            session = await get_session()
+            async with session.post(
+                HIGGS_URL,
+                json={"text": "Hello."},
+                headers=_runpod_headers(),
+                timeout=aiohttp.ClientTimeout(total=120, sock_read=120),
+            ) as resp:
+                async for _ in resp.content.iter_any():
+                    pass
+                logger.info(f"Startup TTS warmup complete (status {resp.status})")
+        except Exception as e:
+            logger.warning(f"Startup TTS warmup error (non-fatal): {e}")
+        # then hand off to the keepalive loop
+        await _keepalive_loop()
+    asyncio.create_task(_warmup())
 
 def create_wav_buffer(audio_data: bytes) -> io.BytesIO:
     buffer = io.BytesIO()
@@ -219,19 +274,34 @@ async def call_groq_via_manager(session, text, websocket, session_state):
         yield "Thinking error."
 
 async def split_into_sentences(text_stream):
-    """Helper to yield sentences/chunks from a stream of characters/words"""
-    buffer = ""
-    # Sub-sentence and sentence splitting marks
-    terminals = {'.', '!', '?', '\n', ',', ';', ':'}
+    """Yield phrases from LLM stream, optimized for minimum TTS latency.
     
+    Strategy:
+    - Strong punctuation (.!?) splits immediately at 3+ chars → catches 'Hi!', 'Yes.'
+    - Weak punctuation (,;:) splits at 30+ chars → avoids 'Hello,' as a lone chunk
+    - Force-flush at 80 chars (split at last space) → prevents huge run-on chunks
+    """
+    buffer = ""
+    strong = {'.', '!', '?', '\n'}
+    weak = {',', ';', ':'}
+
     async for chunk in text_stream:
         for char in chunk:
             buffer += char
-            # Check if we have a chunk (15 chars is ~3-4 words)
-            if char in terminals and len(buffer.strip()) > 15:
-                yield buffer.strip()
+            stripped = buffer.strip()
+            if char in strong and len(stripped) >= 3:
+                yield stripped
                 buffer = ""
-    
+            elif char in weak and len(stripped) >= 30:
+                yield stripped
+                buffer = ""
+            elif len(stripped) >= 80:
+                # Force-flush at word boundary to avoid cutting mid-word
+                last_space = stripped.rfind(' ')
+                if last_space > 20:
+                    yield stripped[:last_space]
+                    buffer = stripped[last_space:]
+
     if buffer.strip():
         yield buffer.strip()
 
@@ -323,10 +393,18 @@ async def process_audio(audio_buffer: bytes, websocket: WebSocket, session_state
             await safe_send_text(websocket, {"state": "transcribed", "text": "[Low confidence] " + text})
             await safe_send_text(websocket, {"state": "processing", "message": "Asking to repeat..."})
 
-            async with session.post(HIGGS_URL, json={"text": text}, headers=_runpod_headers(), timeout=aiohttp.ClientTimeout(total=30)) as tts_resp:
+            async with session.post(HIGGS_URL, json={"text": text}, headers=_runpod_headers(), timeout=aiohttp.ClientTimeout(total=60)) as tts_resp:
                 if tts_resp.status == 200:
-                    async for chunk in tts_resp.content.iter_any():
-                        if chunk: await safe_send_bytes(websocket, chunk)
+                    residual = bytearray()
+                    async for raw in tts_resp.content.iter_any():
+                        if not raw:
+                            continue
+                        residual.extend(raw)
+                        while len(residual) >= TTS_CHUNK_SIZE:
+                            await safe_send_bytes(websocket, bytes(residual[:TTS_CHUNK_SIZE]))
+                            del residual[:TTS_CHUNK_SIZE]
+                    if residual:
+                        await safe_send_bytes(websocket, bytes(residual))
 
             await safe_send_text(websocket, {"state": "idle", "message": "Listening..."})
             return
@@ -347,48 +425,97 @@ async def process_audio(audio_buffer: bytes, websocket: WebSocket, session_state
         await safe_send_text(websocket, {"state": "error", "message": str(e)})
         return
 
-    # 2 & 3. Streaming Intelligence + TTS
+    # 2 & 3. Streaming LLM → sentence splitting → streaming TTS → websocket
+    # higgs:v5 /generate_stream yields raw int16 PCM @ 24kHz progressively (~270ms to first chunk).
+    #
+    # Architecture: producer/consumer with asyncio.Queue of streaming tasks.
+    #   Producer:  for each sentence from LLM → immediately open TTS HTTP stream → enqueue the response
+    #   Consumer:  drain chunks from each TTS stream in order → relay to websocket
+    #
+    # Sentence N+1's TTS synthesis starts the moment the LLM emits it (while N is still playing).
+    # Gapless thanks to a shared residual buffer across sentence boundaries.
     await safe_send_text(websocket, {"state": "processing", "message": "Thinking..."})
-    
-    full_response = ""
-    try:
-        # Iterate through sentences as they are generated
-        # Use call_groq_via_manager to include history
-        async for sentence in split_into_sentences(call_groq_via_manager(session, text, websocket, session_state)):
-            full_response += " " + sentence
-            logger.info(f"Sentence ready for TTS: {sentence}")
-            
-            # Notify client of partial text (Thinking...)
-            await safe_send_text(websocket, {"state": "thinking", "text": full_response.strip()})
-            
-            # Immediately call TTS for this sentence (streaming)
-            try:
-                # Determine voice parameters
-                tts_payload = {"text": sentence}
-                if session_state.get("voice_mode") == "user" and session_state.get("best_user_audio"):
-                    try:
-                        with open(session_state["best_user_audio"], "rb") as af:
-                            audio_bytes = af.read()
-                        tts_payload["ref_audio_base64"] = base64.b64encode(audio_bytes).decode("utf-8")
-                    except Exception as e:
-                        logger.error(f"Failed to read ref audio for base64: {e}")
-                    tts_payload["temperature"] = 0.3 # Lower temperature for stable voice cloning
-                    if session_state.get("best_user_text"):
-                        tts_payload["ref_text"] = session_state["best_user_text"]
-                
-                async with session.post(HIGGS_URL, json=tts_payload, headers=_runpod_headers(), timeout=aiohttp.ClientTimeout(total=30)) as resp:
-                    if resp.status == 200:
-                        # Stream the audio chunks from Higgs
-                        async for chunk in resp.content.iter_any():
-                            if chunk:
-                                await safe_send_bytes(websocket, chunk)
-                        logger.info(f"Finished relaying Higgs stream for sentence: {sentence[:20]}...")
-                    else:
-                        logger.error(f"Higgs failed for sentence: {resp.status}")
-            except Exception as e:
-                logger.error(f"TTS sentence exception: {e}")
 
-        # After all sentences are done
+    def build_tts_payload(sentence: str) -> dict:
+        payload = {"text": sentence}
+        if session_state.get("voice_mode") == "user" and session_state.get("best_user_audio"):
+            try:
+                with open(session_state["best_user_audio"], "rb") as af:
+                    payload["ref_audio_base64"] = base64.b64encode(af.read()).decode("utf-8")
+            except Exception as e:
+                logger.error(f"Failed to read ref audio: {e}")
+            payload["temperature"] = 0.3
+            if session_state.get("best_user_text"):
+                payload["ref_text"] = session_state["best_user_text"]
+        return payload
+
+    # Each item in the queue is an aiohttp response context manager (already opened).
+    # Using a queue of futures that resolve to async iterators.
+    chunk_queue: asyncio.Queue = asyncio.Queue()  # items: asyncio.Queue[bytes] | None sentinel
+    full_response = ""
+
+    async def producer():
+        """For each LLM sentence, open TTS stream and push a per-sentence byte queue."""
+        nonlocal full_response
+        try:
+            async for sentence in split_into_sentences(
+                call_groq_via_manager(session, text, websocket, session_state)
+            ):
+                full_response += " " + sentence
+                logger.info(f"Sentence → TTS: {sentence}")
+                await safe_send_text(websocket, {"state": "thinking", "text": full_response.strip()})
+
+                # Each sentence gets its own byte queue; producer fills it, consumer drains it.
+                sent_q: asyncio.Queue = asyncio.Queue()
+                await chunk_queue.put(sent_q)  # tell consumer a new sentence is coming
+
+                async def _stream_sentence(s=sentence, sq=sent_q):
+                    try:
+                        async with session.post(
+                            HIGGS_URL, json=build_tts_payload(s),
+                            headers=_runpod_headers(),
+                            timeout=aiohttp.ClientTimeout(total=60)
+                        ) as resp:
+                            if resp.status != 200:
+                                body = await resp.text()
+                                logger.error(f"TTS {resp.status} for: {s[:30]} | body: {body[:300]}")
+                            else:
+                                async for raw in resp.content.iter_any():
+                                    if raw:
+                                        await sq.put(raw)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as e:
+                        logger.error(f"TTS stream error: {e}")
+                    finally:
+                        await sq.put(None)  # sentinel: sentence done
+
+                asyncio.create_task(_stream_sentence())
+        finally:
+            await chunk_queue.put(None)  # sentinel: all sentences done
+
+    async def consumer():
+        """Drain per-sentence byte queues in order, relay fixed-size PCM chunks."""
+        residual = bytearray()
+        while True:
+            sent_q = await chunk_queue.get()
+            if sent_q is None:
+                break  # all done
+            # Drain this sentence's byte stream
+            while True:
+                raw = await sent_q.get()
+                if raw is None:
+                    break  # sentence done
+                residual.extend(raw)
+                while len(residual) >= TTS_CHUNK_SIZE:
+                    await safe_send_bytes(websocket, bytes(residual[:TTS_CHUNK_SIZE]))
+                    del residual[:TTS_CHUNK_SIZE]
+        # Flush any partial tail chunk
+        if residual:
+            await safe_send_bytes(websocket, bytes(residual))
+
+    try:
+        await asyncio.gather(producer(), consumer())
         await safe_send_text(websocket, {"state": "idle", "message": "Listening..."})
 
     except asyncio.CancelledError:
@@ -408,7 +535,7 @@ async def websocket_endpoint(websocket: WebSocket):
     audio_buffer = bytearray()
     silence_start = None
     is_speaking = False
-    is_speaking = False
+    speech_frames = 0
     current_task = None
     
     # Session state for voice cloning
@@ -458,22 +585,26 @@ async def websocket_endpoint(websocket: WebSocket):
                 logger.debug(f"Audio energy: {energy:.1f}")
             
             if energy > VAD_THRESHOLD:
+                speech_frames += 1
                 if not is_speaking:
-                    is_speaking = True
-                    logger.info("Speech detected")
-                    # Interruption: Cancel existing task and notify client
-                    if current_task and not current_task.done():
-                        current_task.cancel()
-                        logger.info("Interrupted current task")
-                        await safe_send_text(websocket, {"state": "interrupted"})
-                    
-                    await safe_send_text(websocket, {"state": "listening", "message": "Listening..."})
+                    if speech_frames >= VAD_MIN_SPEECH_FRAMES:
+                        is_speaking = True
+                        logger.info("Speech detected")
+                        # Interruption: Cancel existing task and notify client
+                        if current_task and not current_task.done():
+                            current_task.cancel()
+                            logger.info("Interrupted current task")
+                            await safe_send_text(websocket, {"state": "interrupted"})
+                        
+                        await safe_send_text(websocket, {"state": "listening", "message": "Listening..."})
                 
                 # Reset silence timer
                 silence_start = None
-                audio_buffer.extend(data)
+                if is_speaking:
+                    audio_buffer.extend(data)
                 
             else:
+                speech_frames = 0
                 # Silence frame
                 if is_speaking:
                     # Append silence if we are in "speaking" mode to catch trailing words

@@ -32,6 +32,11 @@ AUDIO_TOKENIZER_PATH = os.environ.get("HIGGS_TOKENIZER_PATH", "bosonai/higgs-aud
 DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
 SAMPLE_RATE = 24000
 
+# Streaming latency tuning (can be overridden via env vars at deploy-time)
+STREAM_DECODE_CONTEXT = int(os.environ.get("HIGGS_STREAM_DECODE_CONTEXT", "8"))
+STREAM_CHUNK_TOKENS = int(os.environ.get("HIGGS_STREAM_CHUNK_TOKENS", "6"))
+STREAM_OVERLAP_SAMPLES = int(os.environ.get("HIGGS_STREAM_OVERLAP_SAMPLES", "96"))
+
 # Model state — loaded in background thread so /ping can respond during startup
 serve_engine = None
 _model_loading = True
@@ -239,9 +244,9 @@ async def generate_audio_stream(req: GenerateRequest):
         samples_per_token = int(sr // tps)
         
         # Buffer for decoding context (to prevent edge artifacts)
-        DECODE_CONTEXT = 16 
+        DECODE_CONTEXT = STREAM_DECODE_CONTEXT
         # Chunk size to yield to client (buffer this many stable tokens)
-        CHUNK_TOKENS = 12 # ~160ms at 75 TPS
+        CHUNK_TOKENS = STREAM_CHUNK_TOKENS
         
         async for delta in serve_engine.generate_delta_stream(
             chat_ml_sample=ChatMLSample(messages=messages),
@@ -273,7 +278,7 @@ async def generate_audio_stream(req: GenerateRequest):
                         wv_full = serve_engine.audio_tokenizer.decode(vq_code.unsqueeze(0).to(DEVICE))[0, 0]
                         
                         # We want to yield up to `end_token`, but we also need a small overlap for crossfading
-                        OVERLAP_SAMPLES = 160  # ~6.6ms at 24kHz
+                        OVERLAP_SAMPLES = STREAM_OVERLAP_SAMPLES
                         
                         offset = (start_token - decode_start) * samples_per_token
                         count = (end_token - start_token) * samples_per_token
@@ -338,7 +343,7 @@ async def generate_audio_stream(req: GenerateRequest):
                 vq_code = reverted[:, decode_start : end_token].clip(0, serve_engine.audio_codebook_size - 1)
                 wv_full = serve_engine.audio_tokenizer.decode(vq_code.unsqueeze(0).to(DEVICE))[0, 0]
                 
-                OVERLAP_SAMPLES = 160
+                OVERLAP_SAMPLES = STREAM_OVERLAP_SAMPLES
                 offset = (start_token - decode_start) * samples_per_token
                 blend_offset = offset - OVERLAP_SAMPLES if yielded_tokens > 0 else offset
                 wv_chunk = wv_full[blend_offset:].copy()
@@ -354,8 +359,3 @@ async def generate_audio_stream(req: GenerateRequest):
                 yield audio_int16.tobytes()
 
     return StreamingResponse(audio_generator(), media_type="application/octet-stream")
-
-# Alias used by docker-compose and s2s_server
-@app.post("/generate_stream")
-def generate_stream(req: GenerateRequest):
-    return generate_audio(req)

@@ -1,0 +1,703 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Live Translation</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg:       #0d0f14;
+      --surface:  #161b26;
+      --border:   #2a3045;
+      --accent:   #4f8ef7;
+      --accent2:  #36d9b1;
+      --danger:   #e25c5c;
+      --muted:    #667799;
+      --text:     #e2e8f0;
+      --text-dim: #94a3b8;
+    }
+
+    html, body { height: 100%; background: var(--bg); color: var(--text); font-family: 'Segoe UI', system-ui, sans-serif; }
+
+    /* ── Layout ── */
+    body { display: flex; flex-direction: column; align-items: center; padding: 24px 16px; gap: 20px; }
+
+    header { text-align: center; }
+    header h1 { font-size: 1.6rem; font-weight: 700; letter-spacing: -0.3px; }
+    header p  { color: var(--text-dim); font-size: 0.85rem; margin-top: 4px; }
+
+    /* ── Language selector row ── */
+    .lang-row {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 14px 20px;
+      width: 100%;
+      max-width: 700px;
+    }
+
+    .lang-row label { font-size: 0.8rem; color: var(--text-dim); font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; }
+
+    .lang-row select {
+      flex: 1;
+      background: var(--bg);
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 8px 12px;
+      font-size: 0.95rem;
+      cursor: pointer;
+      outline: none;
+      appearance: none;
+    }
+    .lang-row select:focus { border-color: var(--accent); }
+
+    .swap-btn {
+      background: none;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      color: var(--text-dim);
+      padding: 8px 12px;
+      cursor: pointer;
+      font-size: 1.1rem;
+      transition: color .15s, border-color .15s;
+    }
+    .swap-btn:hover { color: var(--accent); border-color: var(--accent); }
+
+    .speak-toggle {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 0.85rem;
+      color: var(--text-dim);
+      cursor: pointer;
+      user-select: none;
+    }
+    .speak-toggle input[type=checkbox] { accent-color: var(--accent2); width: 16px; height: 16px; cursor: pointer; }
+
+    /* ── Transcript panels ── */
+    .panels {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 16px;
+      width: 100%;
+      max-width: 900px;
+    }
+
+    @media (max-width: 620px) { .panels { grid-template-columns: 1fr; } }
+
+    .panel {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 18px;
+      min-height: 260px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+
+    .panel-title {
+      font-size: 0.75rem;
+      text-transform: uppercase;
+      letter-spacing: 0.6px;
+      font-weight: 700;
+      color: var(--text-dim);
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .panel-title .lang-badge {
+      background: var(--accent);
+      color: #fff;
+      border-radius: 4px;
+      padding: 1px 6px;
+      font-size: 0.7rem;
+    }
+    #translationPanel .panel-title .lang-badge { background: var(--accent2); }
+
+    .transcript-area {
+      flex: 1;
+      overflow-y: auto;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      padding-right: 4px;
+    }
+    .transcript-area::-webkit-scrollbar { width: 4px; }
+    .transcript-area::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+
+    .entry {
+      padding: 10px 14px;
+      border-radius: 10px;
+      font-size: 0.95rem;
+      line-height: 1.55;
+      animation: fadeIn .25s ease;
+    }
+    .entry.original    { background: rgba(79,142,247,.1); border-left: 3px solid var(--accent); }
+    .entry.translation { background: rgba(54,217,177,.1); border-left: 3px solid var(--accent2); }
+    .entry.partial     { opacity: .55; font-style: italic; }
+      .lang-chip {
+        display: inline-block;
+        font-size: 0.68rem;
+        font-weight: 700;
+        text-transform: uppercase;
+        letter-spacing: 0.5px;
+        padding: 1px 6px;
+        border-radius: 4px;
+        margin-right: 6px;
+        background: rgba(79,142,247,.25);
+        color: var(--accent);
+      }
+      .entry.translation .lang-chip { background: rgba(54,217,177,.25); color: var(--accent2); }
+
+    @keyframes fadeIn { from { opacity:0; transform: translateY(4px); } to { opacity:1; transform: none; } }
+
+    .empty-hint {
+      color: var(--muted);
+      font-size: 0.85rem;
+      text-align: center;
+      margin: auto;
+      padding: 20px;
+    }
+
+    /* ── Controls ── */
+    .controls { display: flex; flex-direction: column; align-items: center; gap: 12px; }
+
+    .mic-btn {
+      width: 70px; height: 70px;
+      border-radius: 50%;
+      border: none;
+      background: var(--accent);
+      color: #fff;
+      font-size: 1.8rem;
+      cursor: pointer;
+      transition: transform .1s, background .15s, box-shadow .15s;
+      box-shadow: 0 0 0 0 rgba(79,142,247,.5);
+      display: flex; align-items: center; justify-content: center;
+    }
+    .mic-btn.recording {
+      background: var(--danger);
+      animation: pulse 1.6s infinite;
+    }
+    .mic-btn:active { transform: scale(.93); }
+
+    @keyframes pulse {
+      0%   { box-shadow: 0 0 0 0 rgba(226,92,92,.5); }
+      70%  { box-shadow: 0 0 0 16px rgba(226,92,92,0); }
+      100% { box-shadow: 0 0 0 0 rgba(226,92,92,0); }
+    }
+
+    /* ── Status bar ── */
+    .status-bar {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 0.82rem;
+      color: var(--text-dim);
+    }
+    .dot {
+      width: 8px; height: 8px;
+      border-radius: 50%;
+      background: var(--muted);
+      transition: background .2s;
+    }
+    .dot.listening  { background: var(--accent);  animation: blink 1s infinite; }
+    .dot.processing { background: #f7a94f;         animation: blink .6s infinite; }
+    .dot.connected  { background: var(--accent2); }
+    .dot.error      { background: var(--danger); }
+    @keyframes blink { 0%,100% {opacity:1} 50% {opacity:.3} }
+
+    /* ── VAD meter ── */
+    .vad-meter {
+      width: 160px; height: 4px;
+      background: var(--border);
+      border-radius: 2px;
+      overflow: hidden;
+    }
+    .vad-bar { height: 100%; width: 0%; background: var(--accent2); transition: width .05s linear; }
+  </style>
+</head>
+<body>
+
+  <header>
+    <h1>🌐 Live Translation</h1>
+    <p>Powered by NVIDIA Canary-1b — speak and get real-time subtitles</p>
+  </header>
+
+  <!-- Language selector -->
+  <div class="lang-row">
+    <label>From</label>
+    <select id="srcLang">
+      <option value="auto">🔍 Auto-detect</option>
+      <option value="en" selected>🇬🇧 English</option>
+      <option value="nl">🇳🇱 Dutch</option>
+      <option value="de">🇩🇪 German</option>
+      <option value="fr">🇫🇷 French</option>
+      <option value="es">🇪🇸 Spanish</option>
+      <option value="it">🇮🇹 Italian</option>
+      <option value="pt">🇵🇹 Portuguese</option>
+      <option value="pl">🇵🇱 Polish</option>
+      <option value="ru">🇷🇺 Russian</option>
+      <option value="uk">🇺🇦 Ukrainian</option>
+      <option value="sv">🇸🇪 Swedish</option>
+      <option value="no">🇳🇴 Norwegian</option>
+      <option value="da">🇩🇰 Danish</option>
+      <option value="fi">🇫🇮 Finnish</option>
+      <option value="tr">🇹🇷 Turkish</option>
+      <option value="ar">🇸🇦 Arabic</option>
+      <option value="hi">🇮🇳 Hindi</option>
+      <option value="ja">🇯🇵 Japanese</option>
+      <option value="ko">🇰🇷 Korean</option>
+      <option value="zh">🇨🇳 Chinese</option>
+    </select>
+
+    <button class="swap-btn" title="Swap languages" id="swapBtn">⇄</button>
+
+    <label>To</label>
+    <select id="tgtLang">
+      <option value="nl" selected>🇳🇱 Dutch</option>
+      <option value="en">🇬🇧 English</option>
+      <option value="de">🇩🇪 German</option>
+      <option value="fr">🇫🇷 French</option>
+      <option value="es">🇪🇸 Spanish</option>
+      <option value="it">🇮🇹 Italian</option>
+      <option value="pt">🇵🇹 Portuguese</option>
+      <option value="pl">🇵🇱 Polish</option>
+      <option value="ru">🇷🇺 Russian</option>
+      <option value="uk">🇺🇦 Ukrainian</option>
+      <option value="sv">🇸🇪 Swedish</option>
+      <option value="no">🇳🇴 Norwegian</option>
+      <option value="da">🇩🇰 Danish</option>
+      <option value="fi">🇫🇮 Finnish</option>
+      <option value="tr">🇹🇷 Turkish</option>
+      <option value="ar">🇸🇦 Arabic</option>
+      <option value="hi">🇮🇳 Hindi</option>
+      <option value="ja">🇯🇵 Japanese</option>
+      <option value="ko">🇰🇷 Korean</option>
+      <option value="zh">🇨🇳 Chinese</option>
+    </select>
+
+    <label class="speak-toggle" title="Speak the translation through TTS">
+      <input type="checkbox" id="speakCheck" /> 🔊 Speak
+    </label>
+  </div>
+
+  <!-- Dual panels -->
+  <div class="panels">
+    <div class="panel" id="originalPanel">
+      <div class="panel-title">
+        🎤 Original
+          <span class="lang-badge" id="srcBadge">AUTO</span>
+      </div>
+      <div class="transcript-area" id="originalArea">
+        <div class="empty-hint">Start speaking to see the original transcript here</div>
+      </div>
+    </div>
+
+    <div class="panel" id="translationPanel">
+      <div class="panel-title">
+        💬 Translation
+          <span class="lang-badge" id="tgtBadge">NL</span>
+      </div>
+      <div class="transcript-area" id="translationArea">
+        <div class="empty-hint">Translations will appear here</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Controls -->
+  <div class="controls">
+    <button class="mic-btn" id="micBtn" title="Start / Stop">🎤</button>
+
+    <div class="status-bar">
+      <div class="dot" id="statusDot"></div>
+      <span id="statusText">Disconnected</span>
+    </div>
+
+    <div class="vad-meter" title="Microphone energy level">
+      <div class="vad-bar" id="vadBar"></div>
+    </div>
+  </div>
+
+  <script>
+    // ── Elements ──────────────────────────────────────────────────────────────
+    const micBtn     = document.getElementById('micBtn');
+    const srcLang    = document.getElementById('srcLang');
+    const tgtLang    = document.getElementById('tgtLang');
+    const swapBtn    = document.getElementById('swapBtn');
+    const speakCheck = document.getElementById('speakCheck');
+    const originalArea   = document.getElementById('originalArea');
+    const translationArea = document.getElementById('translationArea');
+    const srcBadge   = document.getElementById('srcBadge');
+    const tgtBadge   = document.getElementById('tgtBadge');
+    const statusDot  = document.getElementById('statusDot');
+    const statusText = document.getElementById('statusText');
+    const vadBar     = document.getElementById('vadBar');
+
+    // ── State ─────────────────────────────────────────────────────────────────
+    let ws           = null;
+    let micCtx       = null;
+    let playCtx      = null;   // 24 kHz context for TTS playback
+    let processor    = null;
+    let microphone   = null;
+    let isActive     = false;
+    let nextPlayTime = 0;
+    let vadAnimId    = null;
+    let analyser     = null;
+    let vadDataArray = null;
+    let ttsTailBytes = new Uint8Array(0);
+    const activeTtsSources = new Set();
+    let capturePaused = false;
+    let interimTransEl = null;  // element showing the current interim translation
+    let interimOrigEl  = null;  // element showing the current interim original
+
+    // Canary supports only these pairs (English must be one side)
+    // No pair restrictions — Groq translates any language combination
+    const LANG_LABELS = {
+      auto:'AUTO', en:'EN', nl:'NL', de:'DE', fr:'FR', es:'ES',
+      it:'IT', pt:'PT', pl:'PL', ru:'RU', uk:'UA', sv:'SV',
+      no:'NO', da:'DA', fi:'FI', tr:'TR', ar:'AR', hi:'HI',
+      ja:'JA', ko:'KO', zh:'ZH',
+    };
+
+    // ── Language logic ────────────────────────────────────────────────────────
+    function enforceLangConstraints() {
+      // No restrictions — any source → any target via Groq
+      updateBadges();
+    }
+
+    function updateBadges() {
+      const src = srcLang.value;
+      srcBadge.textContent = src === 'auto' ? 'AUTO' : (LANG_LABELS[src] || src.toUpperCase());
+      tgtBadge.textContent = LANG_LABELS[tgtLang.value] || tgtLang.value.toUpperCase();
+    }
+
+    srcLang.addEventListener('change', () => {
+      enforceLangConstraints();
+      sendConfig();
+    });
+    tgtLang.addEventListener('change', () => { updateBadges(); sendConfig(); });
+    speakCheck.addEventListener('change', sendConfig);
+
+    swapBtn.addEventListener('click', () => {
+      const a = srcLang.value, b = tgtLang.value;
+        if (a === 'auto') {
+          // auto→X  →  X→en (can't put auto in target)
+          srcLang.value = b;
+          tgtLang.value = 'en';
+        } else {
+          srcLang.value = b;
+          tgtLang.value = a;
+        }
+        enforceLangConstraints();
+        sendConfig();
+    });
+
+
+    enforceLangConstraints();
+
+    // ── Status helpers ────────────────────────────────────────────────────────
+    function setStatus(state, msg) {
+      statusDot.className = 'dot ' + state;
+      statusText.textContent = msg;
+    }
+
+    // ── Transcript helpers ────────────────────────────────────────────────────
+    let originalSeq = 0, translationSeq = 0;
+
+    function clearHints() {
+      const oh = originalArea.querySelector('.empty-hint');
+      const th = translationArea.querySelector('.empty-hint');
+      if (oh) oh.remove();
+      if (th) th.remove();
+    }
+
+    function addEntry(area, text, type, langLabel) {
+      clearHints();
+      const div = document.createElement('div');
+      div.className = `entry ${type}`;
+        if (langLabel) {
+          const chip = document.createElement('span');
+          chip.className = 'lang-chip';
+          chip.textContent = langLabel;
+          div.appendChild(chip);
+          div.appendChild(document.createTextNode(text));
+        } else {
+          div.textContent = text;
+        }
+      area.appendChild(div);
+      area.scrollTop = area.scrollHeight;
+      return div;
+    }
+
+    // ── WebSocket ──────────────────────────────────────────────────────────────
+    const WS_URL = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws';
+
+    function sendConfig() {
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({
+          type: 'config',
+          source_lang: srcLang.value,
+          target_lang: tgtLang.value,
+          speak: speakCheck.checked,
+        }));
+      }
+    }
+
+    function connectWS() {
+      ws = new WebSocket(WS_URL);
+      ws.binaryType = 'arraybuffer';
+
+      ws.onopen = () => {
+        setStatus('connected', 'Connected');
+        sendConfig();
+        startMic();
+
+        // keepalive ping
+        clearInterval(window._pingTimer);
+        window._pingTimer = setInterval(() => {
+          if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({type:'ping'}));
+        }, 15000);
+      };
+
+      ws.onmessage = (evt) => {
+        if (evt.data instanceof ArrayBuffer) {
+          // TTS audio chunk
+          playPCM(evt.data);
+          return;
+        }
+        let msg;
+        try { msg = JSON.parse(evt.data); } catch { return; }
+
+        switch (msg.state) {
+          case 'idle':
+            capturePaused = false;
+            setStatus('connected', 'Listening…');
+            break;
+          case 'listening':
+            setStatus('listening', 'Hearing speech…');
+            break;
+          case 'processing':
+            setStatus('processing', 'Transcribing…');
+            break;
+          case 'translating':
+            setStatus('processing', 'Translating…');
+            break;
+          case 'interim': {
+            // Live partial translation — replace previous interim element
+            setStatus('listening', 'Translating live…');
+            clearHints();
+            if (msg.translation) {
+              if (interimTransEl) {
+                interimTransEl.lastChild.textContent = msg.translation;
+              } else {
+                interimTransEl = addEntry(translationArea, msg.translation, 'translation partial', (msg.target_lang || '').toUpperCase());
+              }
+            }
+            if (msg.original) {
+              if (interimOrigEl) {
+                interimOrigEl.lastChild.textContent = msg.original;
+              } else {
+                interimOrigEl = addEntry(originalArea, msg.original, 'original partial', msg.detected_lang ? msg.detected_lang.toUpperCase() : '');
+              }
+            }
+            break;
+          }
+          case 'tts_start':
+            // Keep queued playback for strict sequential speech.
+            break;
+          case 'tts_end':
+            // Add a tiny gap so utterances are perceptually separated.
+            if (playCtx) {
+              const now = playCtx.currentTime;
+              if (nextPlayTime < now) nextPlayTime = now;
+              nextPlayTime += 0.06;
+            }
+            break;
+          case 'result':
+            setStatus('connected', 'Done');
+            // Remove interim elements — replace with final
+            if (interimOrigEl)  { interimOrigEl.remove();  interimOrigEl = null; }
+            if (interimTransEl) { interimTransEl.remove(); interimTransEl = null; }
+            if (msg.original) {
+              addEntry(originalArea, msg.original, 'original', msg.detected_lang ? msg.detected_lang.toUpperCase() : '');
+            }
+            if (msg.translation) {
+              addEntry(translationArea, msg.translation, 'translation', (msg.target_lang || '').toUpperCase());
+            }
+            break;
+          case 'configured':
+            capturePaused = false;
+            // Server acknowledged config update
+            break;
+          case 'error':
+            capturePaused = false;
+            interimTransEl = null;
+            interimOrigEl = null;
+            setStatus('error', 'Error: ' + (msg.message || '?'));
+            break;
+        }
+      };
+
+      ws.onclose = () => {
+        setStatus('', 'Disconnected');
+        clearInterval(window._pingTimer);
+        stopMic();
+        activateBtn(false);
+      };
+
+      ws.onerror = () => setStatus('error', 'Connection error');
+    }
+
+    // ── Microphone ────────────────────────────────────────────────────────────
+    async function startMic() {
+      try {
+        micCtx  = new AudioContext({ sampleRate: 16000 });
+        playCtx = new AudioContext({ sampleRate: 24000 });
+
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: {
+          channelCount: 1, sampleRate: 16000, echoCancellation: true, noiseSuppression: true,
+        }});
+        microphone = micCtx.createMediaStreamSource(stream);
+
+        // VAD meter via AnalyserNode
+        analyser = micCtx.createAnalyser();
+        analyser.fftSize = 256;
+        vadDataArray = new Uint8Array(analyser.frequencyBinCount);
+        microphone.connect(analyser);
+
+        processor = micCtx.createScriptProcessor(4096, 1, 1);
+        processor.onaudioprocess = (e) => {
+          if (!isActive || capturePaused || !ws || ws.readyState !== WebSocket.OPEN) return;
+          const f32 = e.inputBuffer.getChannelData(0);
+          const buf = new ArrayBuffer(f32.length * 2);
+          const dv  = new DataView(buf);
+          for (let i = 0; i < f32.length; i++) {
+            const s = Math.max(-1, Math.min(1, f32[i]));
+            dv.setInt16(i * 2, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+          }
+          ws.send(buf);
+        };
+        microphone.connect(processor);
+        processor.connect(micCtx.destination);
+
+        startVadMeter();
+      } catch (err) {
+        setStatus('error', 'Mic error: ' + err.message);
+        activateBtn(false);
+      }
+    }
+
+    function stopMic() {
+      cancelAnimationFrame(vadAnimId);
+      if (processor)    { processor.disconnect(); processor = null; }
+      if (microphone)   { microphone.disconnect(); microphone = null; }
+      if (micCtx)       { micCtx.close().catch(() => {}); micCtx = null; }
+      if (playCtx)      { playCtx.close().catch(() => {}); playCtx = null; }
+      clearTTSQueue();
+      capturePaused = false;
+      analyser = null; vadDataArray = null;
+      vadBar.style.width = '0%';
+      nextPlayTime = 0;
+    }
+
+    function startVadMeter() {
+      function tick() {
+        if (!analyser) return;
+        analyser.getByteTimeDomainData(vadDataArray);
+        let rms = 0;
+        for (let i = 0; i < vadDataArray.length; i++) {
+          const v = (vadDataArray[i] - 128) / 128;
+          rms += v * v;
+        }
+        rms = Math.sqrt(rms / vadDataArray.length);
+        vadBar.style.width = Math.min(100, rms * 400) + '%';
+        vadAnimId = requestAnimationFrame(tick);
+      }
+      vadAnimId = requestAnimationFrame(tick);
+    }
+
+    // ── TTS playback (optional) ───────────────────────────────────────────────
+    function clearTTSQueue() {
+      activeTtsSources.forEach(src => {
+        try { src.stop(0); } catch {}
+      });
+      activeTtsSources.clear();
+      nextPlayTime = 0;
+      ttsTailBytes = new Uint8Array(0);
+    }
+
+    function playPCM(arrayBuffer) {
+      if (!playCtx) return;
+
+      // Ensure samples are aligned on 16-bit boundaries across websocket chunks.
+      let incoming = new Uint8Array(arrayBuffer);
+      if (ttsTailBytes.length) {
+        const merged = new Uint8Array(ttsTailBytes.length + incoming.length);
+        merged.set(ttsTailBytes, 0);
+        merged.set(incoming, ttsTailBytes.length);
+        incoming = merged;
+        ttsTailBytes = new Uint8Array(0);
+      }
+
+      if (incoming.length < 2) {
+        ttsTailBytes = incoming;
+        return;
+      }
+
+      const evenLen = incoming.length - (incoming.length % 2);
+      if (evenLen !== incoming.length) {
+        ttsTailBytes = incoming.slice(evenLen);
+        incoming = incoming.slice(0, evenLen);
+      }
+
+      if (!incoming.length) return;
+
+      const i16 = new Int16Array(incoming.buffer, incoming.byteOffset, incoming.byteLength / 2);
+      const f32 = new Float32Array(i16.length);
+      for (let i = 0; i < i16.length; i++) f32[i] = i16[i] / 32768;
+
+      const audioBuf = playCtx.createBuffer(1, f32.length, 24000);
+      audioBuf.copyToChannel(f32, 0);
+      const src = playCtx.createBufferSource();
+      src.buffer = audioBuf;
+      src.connect(playCtx.destination);
+      activeTtsSources.add(src);
+      src.onended = () => activeTtsSources.delete(src);
+
+      const now = playCtx.currentTime;
+      if (nextPlayTime < now) nextPlayTime = now + 0.15;
+      src.start(nextPlayTime);
+      nextPlayTime += audioBuf.duration;
+    }
+
+    // ── Toggle ────────────────────────────────────────────────────────────────
+    function activateBtn(on) {
+      isActive = on;
+      micBtn.classList.toggle('recording', on);
+      micBtn.textContent = on ? '⏹' : '🎤';
+      // Lock/unlock language selectors while active
+      srcLang.disabled = on;
+      tgtLang.disabled = on;
+      swapBtn.disabled = on;
+    }
+
+    micBtn.addEventListener('click', () => {
+      if (isActive) {
+        isActive = false;
+        if (ws) ws.close();
+      } else {
+        activateBtn(true);
+        setStatus('', 'Connecting…');
+        connectWS();
+      }
+    });
+  </script>
+</body>
+</html>

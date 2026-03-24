@@ -1,11 +1,11 @@
 from contextlib import asynccontextmanager
 import threading
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from pydantic import BaseModel
-import nemo.collections.asr as nemo_asr
-import torch
+# NOTE: nemo, torch, OmegaConf are imported lazily inside _load_model / _run_inference
+# so that uvicorn starts instantly and /ping can respond during init.
 import os
 import glob
 import shutil
@@ -14,7 +14,7 @@ import base64
 
 # Configuration
 MODEL_NAME = "nvidia/canary-1b-v2"
-DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
+DEVICE = "cpu"  # set properly in _load_model once torch is imported
 
 # RunPod model caching stores HF models here
 RUNPOD_HF_CACHE = "/runpod-volume/huggingface-cache/hub"
@@ -23,6 +23,8 @@ CANARY_MODEL_PATH = os.environ.get("CANARY_MODEL_PATH", None)
 # Model state — loaded in background thread so /ping can respond during startup
 asr_model = None
 _model_loading = True
+# Serialize all GPU inference + model-config changes (transcription and translation share the model)
+_infer_lock = threading.Lock()
 
 
 def _find_nemo_file():
@@ -76,7 +78,10 @@ def _find_nemo_file():
 
 
 def _load_model():
-    global asr_model, _model_loading
+    global asr_model, _model_loading, DEVICE
+    import torch
+    import nemo.collections.asr as nemo_asr
+    DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
     print(f"=== Canary ASR Server Starting ===")
     print(f"Device: {DEVICE}")
     print(f"CANARY_MODEL_PATH: {CANARY_MODEL_PATH}")
@@ -193,6 +198,126 @@ async def transcribe_b64(req: TranscribeRequest):
             text = hyp.text
             score = float(getattr(hyp, "score", 0.0))
         return {"text": text, "score": score}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+
+
+# ---------------------------------------------------------------------------
+# Translation helpers — Canary-1b supports speech-to-text translation between
+# {en, de, es, fr} (English must be one of the two languages).
+# We serialise all inference through _infer_lock because change_decoding_strategy
+# mutates shared model state.
+# ---------------------------------------------------------------------------
+
+SUPPORTED_LANGS = {
+    "en", "bg", "hr", "cs", "da", "nl", "et", "fi", "fr", "de",
+    "el", "hu", "it", "lv", "lt", "mt", "pl", "pt", "ro", "ru",
+    "sk", "sl", "es", "sv", "uk",
+}
+
+
+def _run_inference(audio_path: str, task: str, source_lang: str, target_lang: str):
+    """Blocking GPU call — must be called while holding _infer_lock."""
+    from omegaconf import OmegaConf
+    try:
+        decoding_cfg = OmegaConf.to_container(asr_model.cfg.decoding, resolve=True)
+        decoding_cfg["task"] = task
+        decoding_cfg["source_lang"] = source_lang
+        decoding_cfg["target_lang"] = target_lang
+        decoding_cfg["pnc"] = "yes"
+        asr_model.change_decoding_strategy(OmegaConf.create(decoding_cfg))
+        results = asr_model.transcribe([audio_path], return_hypotheses=True)
+    finally:
+        # Always restore to vanilla ASR so /transcribe still works correctly
+        try:
+            restore_cfg = OmegaConf.to_container(asr_model.cfg.decoding, resolve=True)
+            restore_cfg["task"] = "asr"
+            restore_cfg["source_lang"] = source_lang
+            restore_cfg["target_lang"] = source_lang
+            asr_model.change_decoding_strategy(OmegaConf.create(restore_cfg))
+        except Exception:
+            pass
+
+    text, score = "", 0.0
+    if results:
+        hyp = results[0]
+        if isinstance(hyp, list):
+            hyp = hyp[0]
+        text = hyp.text
+        score = float(getattr(hyp, "score", 0.0))
+    return text, score
+
+
+@app.post("/translate")
+async def translate_audio(
+    file: UploadFile = File(...),
+    source_lang: str = Query("en", description="Source language code: en / de / es / fr"),
+    target_lang: str = Query("de", description="Target language code: en / de / es / fr"),
+):
+    """Speech-to-text translation. Canary-1b supports en↔{de,es,fr}."""
+    if asr_model is None:
+        raise HTTPException(status_code=503, detail="Model not loaded")
+    if source_lang not in SUPPORTED_LANGS or target_lang not in SUPPORTED_LANGS:
+        raise HTTPException(status_code=400, detail=f"Unsupported lang. Supported: {SUPPORTED_LANGS}")
+    if source_lang == target_lang:
+        raise HTTPException(status_code=400, detail="source_lang and target_lang must differ")
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
+        shutil.copyfileobj(file.file, tmp)
+        tmp_path = tmp.name
+
+    try:
+        import asyncio
+        loop = asyncio.get_event_loop()
+        text, score = await loop.run_in_executor(
+            None,
+            lambda: _run_with_lock(tmp_path, "s2t_translation", source_lang, target_lang),
+        )
+        print(f"Translation [{source_lang}→{target_lang}]: '{text}' (score={score:.3f})")
+        return {"text": text, "score": score, "source_lang": source_lang, "target_lang": target_lang}
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+
+
+def _run_with_lock(audio_path, task, source_lang, target_lang):
+    with _infer_lock:
+        return _run_inference(audio_path, task, source_lang, target_lang)
+
+
+class TranslateRequest(BaseModel):
+    audio_b64: str
+    source_lang: str = "en"
+    target_lang: str = "de"
+
+
+@app.post("/translate_b64")
+async def translate_b64(req: TranslateRequest):
+    """JSON endpoint for translation — receives base64-encoded WAV."""
+    if asr_model is None:
+        raise HTTPException(status_code=503, detail="Model not loaded")
+    if req.source_lang not in SUPPORTED_LANGS or req.target_lang not in SUPPORTED_LANGS:
+        raise HTTPException(status_code=400, detail=f"Unsupported lang pair")
+
+    audio_bytes = base64.b64decode(req.audio_b64)
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
+        tmp.write(audio_bytes)
+        tmp_path = tmp.name
+    try:
+        import asyncio
+        loop = asyncio.get_event_loop()
+        text, score = await loop.run_in_executor(
+            None,
+            lambda: _run_with_lock(tmp_path, "s2t_translation", req.source_lang, req.target_lang),
+        )
+        return {"text": text, "score": score, "source_lang": req.source_lang, "target_lang": req.target_lang}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
     finally:
