@@ -489,31 +489,9 @@
           case 'translating':
             setStatus('processing', 'Translating…');
             break;
-          case 'interim': {
-            // Live partial translation — replace previous interim element
-            setStatus('listening', 'Translating live…');
-            clearHints();
-            if (msg.translation) {
-              if (interimTransEl) {
-                interimTransEl.lastChild.textContent = msg.translation;
-              } else {
-                interimTransEl = addEntry(translationArea, msg.translation, 'translation partial', (msg.target_lang || '').toUpperCase());
-              }
-            }
-            if (msg.original) {
-              if (interimOrigEl) {
-                interimOrigEl.lastChild.textContent = msg.original;
-              } else {
-                interimOrigEl = addEntry(originalArea, msg.original, 'original partial', msg.detected_lang ? msg.detected_lang.toUpperCase() : '');
-              }
-            }
-            break;
-          }
           case 'tts_start':
-            // Keep queued playback for strict sequential speech.
             break;
           case 'tts_end':
-            // Add a tiny gap so utterances are perceptually separated.
             if (playCtx) {
               const now = playCtx.currentTime;
               if (nextPlayTime < now) nextPlayTime = now;
@@ -521,10 +499,8 @@
             }
             break;
           case 'result':
-            setStatus('connected', 'Done');
-            // Remove interim elements — replace with final
-            if (interimOrigEl)  { interimOrigEl.remove();  interimOrigEl = null; }
-            if (interimTransEl) { interimTransEl.remove(); interimTransEl = null; }
+            setStatus('connected', 'Listening…');
+            clearHints();
             if (msg.original) {
               addEntry(originalArea, msg.original, 'original', msg.detected_lang ? msg.detected_lang.toUpperCase() : '');
             }
@@ -534,12 +510,9 @@
             break;
           case 'configured':
             capturePaused = false;
-            // Server acknowledged config update
             break;
           case 'error':
             capturePaused = false;
-            interimTransEl = null;
-            interimOrigEl = null;
             setStatus('error', 'Error: ' + (msg.message || '?'));
             break;
         }
