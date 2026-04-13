@@ -43,6 +43,13 @@ async def get():
 # Configuration
 CANARY_URL = os.environ.get("CANARY_URL", "http://127.0.0.1:8001/transcribe")
 HIGGS_URL = os.environ.get("HIGGS_URL", "http://127.0.0.1:8000/generate_stream")
+VOXTRAL_URL = os.environ.get("VOXTRAL_URL", "http://127.0.0.1:8002/generate_stream")
+# TTS_BACKEND: "higgs" (raw int16 PCM @ 24kHz) or "voxtral" (WAV @ 24kHz)
+TTS_BACKEND = os.environ.get("TTS_BACKEND", "higgs").lower()
+
+def tts_url() -> str:
+    return VOXTRAL_URL if TTS_BACKEND == "voxtral" else HIGGS_URL
+
 # /generate_stream on higgs:v5+ yields raw int16 PCM @ 24kHz as-generated (first chunk ~270ms)
 # Groq Configuration
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
@@ -129,10 +136,11 @@ async def _keepalive_loop():
     while True:
         try:
             session = await get_session()
-            logger.info("TTS keepalive: pinging Higgs worker...")
+            logger.info(f"TTS keepalive: pinging {TTS_BACKEND} worker...")
             async with session.post(
-                HIGGS_URL,
+                tts_url(),
                 json={"text": WARMUP_TEXT},
+
                 headers=_runpod_headers(),
                 timeout=aiohttp.ClientTimeout(total=120, sock_read=120),
             ) as resp:
@@ -155,7 +163,7 @@ async def startup_warmup():
         try:
             session = await get_session()
             async with session.post(
-                HIGGS_URL,
+                tts_url(),
                 json={"text": "Hello."},
                 headers=_runpod_headers(),
                 timeout=aiohttp.ClientTimeout(total=120, sock_read=120),
@@ -393,12 +401,23 @@ async def process_audio(audio_buffer: bytes, websocket: WebSocket, session_state
             await safe_send_text(websocket, {"state": "transcribed", "text": "[Low confidence] " + text})
             await safe_send_text(websocket, {"state": "processing", "message": "Asking to repeat..."})
 
-            async with session.post(HIGGS_URL, json={"text": text}, headers=_runpod_headers(), timeout=aiohttp.ClientTimeout(total=60)) as tts_resp:
+            async with session.post(tts_url(), json={"text": text}, headers=_runpod_headers(), timeout=aiohttp.ClientTimeout(total=60)) as tts_resp:
                 if tts_resp.status == 200:
                     residual = bytearray()
+                    _wav_header_stripped = TTS_BACKEND != "voxtral"  # Higgs: raw PCM; Voxtral: WAV
                     async for raw in tts_resp.content.iter_any():
                         if not raw:
                             continue
+                        if not _wav_header_stripped:
+                            combined = bytes(residual) + raw
+                            wav_end = combined.find(b"data")
+                            if wav_end != -1:
+                                raw = combined[wav_end + 8:]  # skip 'data' + 4-byte size
+                                residual = bytearray()
+                                _wav_header_stripped = True
+                            else:
+                                residual.extend(raw)
+                                continue
                         residual.extend(raw)
                         while len(residual) >= TTS_CHUNK_SIZE:
                             await safe_send_bytes(websocket, bytes(residual[:TTS_CHUNK_SIZE]))
@@ -426,7 +445,7 @@ async def process_audio(audio_buffer: bytes, websocket: WebSocket, session_state
         return
 
     # 2 & 3. Streaming LLM → sentence splitting → streaming TTS → websocket
-    # higgs:v5 /generate_stream yields raw int16 PCM @ 24kHz progressively (~270ms to first chunk).
+    # TTS backend: higgs (raw int16 PCM @ 24kHz) or voxtral (WAV @ 24kHz, header stripped).
     #
     # Architecture: producer/consumer with asyncio.Queue of streaming tasks.
     #   Producer:  for each sentence from LLM → immediately open TTS HTTP stream → enqueue the response
@@ -438,7 +457,9 @@ async def process_audio(audio_buffer: bytes, websocket: WebSocket, session_state
 
     def build_tts_payload(sentence: str) -> dict:
         payload = {"text": sentence}
-        if session_state.get("voice_mode") == "user" and session_state.get("best_user_audio"):
+        if TTS_BACKEND == "voxtral":
+            payload["voice"] = os.environ.get("VOXTRAL_VOICE", "casual_male")
+        elif session_state.get("voice_mode") == "user" and session_state.get("best_user_audio"):
             try:
                 with open(session_state["best_user_audio"], "rb") as af:
                     payload["ref_audio_base64"] = base64.b64encode(af.read()).decode("utf-8")
@@ -471,8 +492,9 @@ async def process_audio(audio_buffer: bytes, websocket: WebSocket, session_state
 
                 async def _stream_sentence(s=sentence, sq=sent_q):
                     try:
+                        wav_stripped = TTS_BACKEND != "voxtral"
                         async with session.post(
-                            HIGGS_URL, json=build_tts_payload(s),
+                            tts_url(), json=build_tts_payload(s),
                             headers=_runpod_headers(),
                             timeout=aiohttp.ClientTimeout(total=60)
                         ) as resp:
@@ -481,8 +503,16 @@ async def process_audio(audio_buffer: bytes, websocket: WebSocket, session_state
                                 logger.error(f"TTS {resp.status} for: {s[:30]} | body: {body[:300]}")
                             else:
                                 async for raw in resp.content.iter_any():
-                                    if raw:
-                                        await sq.put(raw)
+                                    if not raw:
+                                        continue
+                                    if not wav_stripped:
+                                        wav_end = raw.find(b"data")
+                                        if wav_end != -1:
+                                            raw = raw[wav_end + 8:]
+                                            wav_stripped = True
+                                        else:
+                                            continue
+                                    await sq.put(raw)
                     except asyncio.CancelledError:
                         raise
                     except Exception as e:
