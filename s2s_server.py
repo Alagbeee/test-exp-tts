@@ -129,53 +129,9 @@ async def get_session():
         _global_session = aiohttp.ClientSession()
     return _global_session
 
-async def _keepalive_loop():
-    """Send a minimal TTS request every 4 minutes to keep RunPod worker hot in VRAM."""
-    KEEPALIVE_INTERVAL = 240  # seconds
-    WARMUP_TEXT = "Hello."
-    while True:
-        try:
-            session = await get_session()
-            logger.info(f"TTS keepalive: pinging {TTS_BACKEND} worker...")
-            async with session.post(
-                tts_url(),
-                json={"text": WARMUP_TEXT},
-
-                headers=_runpod_headers(),
-                timeout=aiohttp.ClientTimeout(total=120, sock_read=120),
-            ) as resp:
-                # drain the response so the connection completes properly
-                async for _ in resp.content.iter_any():
-                    pass
-                logger.info(f"TTS keepalive done (status {resp.status})")
-        except asyncio.CancelledError:
-            break
-        except Exception as e:
-            logger.warning(f"TTS keepalive error (non-fatal): {e}")
-        await asyncio.sleep(KEEPALIVE_INTERVAL)
-
 @app.on_event("startup")
 async def startup_warmup():
-    """Fire & forget: warm the TTS worker ASAP so the first user turn isn't cold."""
-    async def _warmup():
-        await asyncio.sleep(2)  # let uvicorn settle first
-        logger.info("Startup TTS warmup — sending short request to pre-load model into VRAM...")
-        try:
-            session = await get_session()
-            async with session.post(
-                tts_url(),
-                json={"text": "Hello."},
-                headers=_runpod_headers(),
-                timeout=aiohttp.ClientTimeout(total=120, sock_read=120),
-            ) as resp:
-                async for _ in resp.content.iter_any():
-                    pass
-                logger.info(f"Startup TTS warmup complete (status {resp.status})")
-        except Exception as e:
-            logger.warning(f"Startup TTS warmup error (non-fatal): {e}")
-        # then hand off to the keepalive loop
-        await _keepalive_loop()
-    asyncio.create_task(_warmup())
+    pass  # Voxtral worker is always-on — no warmup pings needed
 
 def create_wav_buffer(audio_data: bytes) -> io.BytesIO:
     buffer = io.BytesIO()
@@ -498,9 +454,12 @@ async def process_audio(audio_buffer: bytes, websocket: WebSocket, session_state
                                 body = await resp.text()
                                 logger.error(f"TTS {resp.status} for: {text_batch[:40]} | body: {body[:300]}")
                             else:
+                                total_bytes = 0
+                                pcm_bytes = 0
                                 async for raw in resp.content.iter_any():
                                     if not raw:
                                         continue
+                                    total_bytes += len(raw)
                                     if not wav_stripped:
                                         wav_end = raw.find(b"data")
                                         if wav_end != -1:
@@ -508,7 +467,9 @@ async def process_audio(audio_buffer: bytes, websocket: WebSocket, session_state
                                             wav_stripped = True
                                         else:
                                             continue
+                                    pcm_bytes += len(raw)
                                     await sq.put(raw)
+                                logger.info(f"TTS response: {total_bytes} total bytes, {pcm_bytes} PCM bytes for: {text_batch[:40]}")
                             break
                     except aiohttp.ClientError as e:
                         if attempt < 2:
@@ -573,6 +534,8 @@ async def process_audio(audio_buffer: bytes, websocket: WebSocket, session_state
     async def consumer():
         """Drain per-sentence byte queues in order, relay fixed-size PCM chunks."""
         residual = bytearray()
+        chunks_sent = 0
+        total_pcm = 0
         while True:
             sent_q = await chunk_queue.get()
             if sent_q is None:
@@ -582,13 +545,17 @@ async def process_audio(audio_buffer: bytes, websocket: WebSocket, session_state
                 raw = await sent_q.get()
                 if raw is None:
                     break  # sentence done
+                total_pcm += len(raw)
                 residual.extend(raw)
                 while len(residual) >= TTS_CHUNK_SIZE:
                     await safe_send_bytes(websocket, bytes(residual[:TTS_CHUNK_SIZE]))
                     del residual[:TTS_CHUNK_SIZE]
+                    chunks_sent += 1
         # Flush any partial tail chunk
         if residual:
             await safe_send_bytes(websocket, bytes(residual))
+            chunks_sent += 1
+        logger.info(f"Consumer done: {total_pcm} PCM bytes, {chunks_sent} chunks sent to websocket")
 
     try:
         await asyncio.gather(producer(), consumer())
