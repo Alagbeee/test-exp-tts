@@ -1,44 +1,83 @@
-# joble-s2s
+# Live Translation
 
-Real-time Speech-to-Speech (S2S) system using RunPod serverless GPU infrastructure.
+Real-time speech translation via WebSocket. Speak in one language, get subtitles and optional TTS in another — with sub-second latency.
+
+**Pipeline:** Browser mic → WebSocket → Canary ASR (NVIDIA) → Groq LLM (correct + translate) → Higgs TTS (optional)
+
+---
+
+## Quick Start (Docker)
+
+```bash
+# 1. Clone
+git clone https://github.com/Alagbeee/test-exp-tts.git
+cd test-exp-tts
+
+# 2. Configure secrets
+cp .env.example .env
+# Edit .env — add your GROQ_API_KEY, RUNPOD_API_KEY, CANARY_URL, HIGGS_URL
+
+# 3. Run
+docker compose up --build
+```
+
+Open `http://localhost:8083` in your browser.
+
+---
+
+## Environment Variables
+
+| Variable | Description |
+|----------|-------------|
+| `GROQ_API_KEY` | Groq API key (LLM translation + ASR correction) |
+| `RUNPOD_API_KEY` | RunPod bearer token |
+| `CANARY_URL` | Canary ASR endpoint — `https://<id>.api.runpod.ai/transcribe` |
+| `HIGGS_URL` | Higgs TTS endpoint — `https://<id>.api.runpod.ai/generate_stream` (optional) |
+
+---
+
+## API
+
+The server exposes a WebSocket API at `ws://<host>:8083/ws`.
+
+See [API_REFERENCE.md](API_REFERENCE.md) for the full protocol — intended for frontend engineers integrating the service.
+
+### HTTP
+- `GET /health` — health check JSON
+- `GET /` — built-in demo frontend
+
+---
 
 ## Architecture
 
-| Component | Service | Docker Image | RunPod Endpoint |
-|-----------|---------|-------------|-----------------|
-| ASR | NVIDIA Canary 1B v2 | `15wins/canary:v4` | `joble-asr` |
-| TTS | Higgs Audio v2 3B | `15wins/higgs:v4` | `joble-tts` |
-| Orchestrator | FastAPI + WebSockets | — | `s2s_server.py` |
-| Frontend | HTML5 Web Audio | — | `s2s_frontend/` |
+| Component | Role |
+|-----------|------|
+| **NVIDIA Canary-1b-v2** (RunPod) | Speech-to-text (ASR) |
+| **Groq llama-3.3-70b-versatile** | Correct ASR output + translate |
+| **Higgs Audio v2** (RunPod) | Text-to-speech (optional) |
+| **WebRTC VAD** | Detect speech vs silence — fires translation on natural pauses |
 
-## Services
+Audio flows: raw 16kHz mono PCM from browser → VAD-gated silence detection → Canary ASR on complete utterances → Groq correction + translation → result sent back over WebSocket.
 
-### ASR — `canary/`
-- **Model**: `nvidia/canary-1b-v2` (baked into image at `/models/canary`)
-- **Server**: FastAPI on port 80, routes: `GET /ping`, `GET /health`, `POST /transcribe`, `POST /transcribe_b64`
-- **Dockerfile**: `Dockerfile.canary-v4` (builds from `15wins/canary:v3`)
+---
 
-### TTS — `higgs/`
-- **Models**: `bosonai/higgs-audio-v2-generation-3B-base` + tokenizer (baked into image)
-- **Server**: FastAPI on port 80, routes: `GET /ping`, `GET /health`, `POST /generate_stream`, `POST /generate_b64`
-- **Dockerfile**: `Dockerfile.higgs-v4` (builds from `15wins/higgs:v3`)
+## Running Locally (without Docker)
 
-### Orchestrator — `s2s_server.py`
-FastAPI + WebSocket server that pipes audio through ASR → LLM → TTS in real time.
-
-### Frontend — `s2s_frontend/`
-HTML5 Web Audio API client for browser-based S2S calls.
-
-## RunPod Setup
-Both endpoints use:
-- **GPU**: RTX 4090 / RTX A5000 / RTX A6000 (24–32GB VRAM)
-- **FlashBoot**: enabled
-- **workersMin**: 1 (always warm)
-- **workersMax**: 3–5
-
-## Environment Variables (`.env`)
+```bash
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+set -a && . ./.env && set +a
+uvicorn translation_server:app --host 0.0.0.0 --port 8083
 ```
-CANARY_URL=https://6j1py0eqi9aokv.api.runpod.ai/transcribe_b64
-HIGGS_URL=https://nyw4niybx5auc0.api.runpod.ai/generate_stream
-HF_TOKEN=...
-```
+
+---
+
+## Infrastructure (RunPod)
+
+Both AI services run as RunPod serverless endpoints:
+
+| Service | Endpoint ID | Docker Image |
+|---------|-------------|--------------|
+| Canary ASR | `d8b6cpdq7sorxt` | `alagbeee/canary:latest` |
+| Higgs TTS | `nyw4niybx5auc0` | `alagbeee/higgs:latest` |
+
