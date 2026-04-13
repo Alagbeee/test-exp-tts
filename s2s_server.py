@@ -181,7 +181,7 @@ async def call_groq_via_manager(session, text, websocket, session_state):
             "Do not mix languages. Provide short, natural-sounding responses under 50 words. "
             "Be warm, upbeat and expressive — use natural energy and enthusiasm in your wording. "
             "Use short punchy sentences. End sentences with '!' when excited or '.' otherwise. "
-            "You CAN laugh. When something is funny or playful, write laughter naturally: 'Haha!', 'Hehe!', 'Ha!' — pick based on how funny it is. NEVER use asterisks or actions like '*laughs*'.\n\n"
+            "NEVER use asterisks, actions, or written laughter like 'Haha'/'Hehe' — the TTS reads them literally and it sounds robotic.\n\n"
             f"Current Voice Mode: {current_voice}.\n"
             "You HAVE the capability to clone the user's voice. "
             "If the user asks to 'clone my voice' or 'speak like me':\n"
