@@ -444,13 +444,19 @@ async def _keep_warm_loop():
         await asyncio.sleep(KEEP_WARM_INTERVAL)
 
 
-# Global WebRTC VAD instance (thread-safe for reads after init)
-_vad = webrtcvad.Vad(VAD_AGGRESSIVENESS)
-
-
 @app.on_event("startup")
 async def _startup():
     asyncio.create_task(_keep_warm_loop())
+
+
+@app.get("/health")
+async def health():
+    return {
+        "status": "ok",
+        "service": "live-translation",
+        "asr": CANARY_TRANSCRIBE_URL,
+        "tts": HIGGS_URL,
+    }
 
 
 @app.get("/")
@@ -468,6 +474,10 @@ async def websocket_endpoint(ws: WebSocket):
     source_lang = "en"
     target_lang = "nl"
     speak = False
+
+    # Per-connection VAD instance — WebRTC VAD has internal adaptive state
+    # that must NOT be shared across connections.
+    _vad = webrtcvad.Vad(VAD_AGGRESSIVENESS)
 
     audio_buffer = bytearray()
     _vad_buf = bytearray()   # accumulates raw bytes until we have a full VAD frame
