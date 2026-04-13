@@ -179,6 +179,8 @@ async def call_groq_via_manager(session, text, websocket, session_state):
             "If the user spoke English, you MUST respond in English. "
             "If the user spoke Dutch, you MUST respond in Dutch. "
             "Do not mix languages. Provide short, natural-sounding responses under 50 words. "
+            "Be warm, upbeat and expressive — use natural energy and enthusiasm in your wording. "
+            "Use short punchy sentences. End sentences with '!' when excited or '.' otherwise. "
             "You CAN laugh if the user is funny, but you MUST ONLY use 'Haha' or 'Hehe'. NEVER use asterisks or actions like '*laughs*'.\n\n"
             f"Current Voice Mode: {current_voice}.\n"
             "You HAVE the capability to clone the user's voice. "
@@ -455,7 +457,7 @@ async def process_audio(audio_buffer: bytes, websocket: WebSocket, session_state
                                 logger.error(f"TTS {resp.status} for: {text_batch[:40]} | body: {body[:300]}")
                             else:
                                 total_bytes = 0
-                                pcm_bytes = 0
+                                pcm_buf = bytearray()
                                 async for raw in resp.content.iter_any():
                                     if not raw:
                                         continue
@@ -467,8 +469,18 @@ async def process_audio(audio_buffer: bytes, websocket: WebSocket, session_state
                                             wav_stripped = True
                                         else:
                                             continue
-                                    pcm_bytes += len(raw)
-                                    await sq.put(raw)
+                                    pcm_buf.extend(raw)
+                                # Normalize volume to consistent peak level
+                                if pcm_buf:
+                                    import numpy as np
+                                    samples = np.frombuffer(pcm_buf, dtype=np.int16).astype(np.float32)
+                                    peak = np.abs(samples).max()
+                                    if peak > 0:
+                                        target = 28000.0  # ~85% of int16 max (32767)
+                                        samples = np.clip(samples * (target / peak), -32768, 32767)
+                                        pcm_buf = samples.astype(np.int16).tobytes()
+                                    pcm_bytes = len(pcm_buf)
+                                    await sq.put(bytes(pcm_buf))
                                 logger.info(f"TTS response: {total_bytes} total bytes, {pcm_bytes} PCM bytes for: {text_batch[:40]}")
                             break
                     except aiohttp.ClientError as e:
