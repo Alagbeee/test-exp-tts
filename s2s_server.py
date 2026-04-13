@@ -493,26 +493,40 @@ async def process_audio(audio_buffer: bytes, websocket: WebSocket, session_state
                 async def _stream_sentence(s=sentence, sq=sent_q):
                     try:
                         wav_stripped = TTS_BACKEND != "voxtral"
-                        async with session.post(
-                            tts_url(), json=build_tts_payload(s),
-                            headers=_runpod_headers(),
-                            timeout=aiohttp.ClientTimeout(total=60)
-                        ) as resp:
-                            if resp.status != 200:
-                                body = await resp.text()
-                                logger.error(f"TTS {resp.status} for: {s[:30]} | body: {body[:300]}")
-                            else:
-                                async for raw in resp.content.iter_any():
-                                    if not raw:
+                        for attempt in range(3):
+                            try:
+                                async with session.post(
+                                    tts_url(), json=build_tts_payload(s),
+                                    headers=_runpod_headers(),
+                                    timeout=aiohttp.ClientTimeout(total=90)
+                                ) as resp:
+                                    if resp.status == 502 and attempt < 2:
+                                        body = await resp.text()
+                                        logger.warning(f"TTS 502 (attempt {attempt+1}), retrying: {s[:30]}")
+                                        await asyncio.sleep(2 ** attempt)
                                         continue
-                                    if not wav_stripped:
-                                        wav_end = raw.find(b"data")
-                                        if wav_end != -1:
-                                            raw = raw[wav_end + 8:]
-                                            wav_stripped = True
-                                        else:
-                                            continue
-                                    await sq.put(raw)
+                                    if resp.status != 200:
+                                        body = await resp.text()
+                                        logger.error(f"TTS {resp.status} for: {s[:30]} | body: {body[:300]}")
+                                    else:
+                                        async for raw in resp.content.iter_any():
+                                            if not raw:
+                                                continue
+                                            if not wav_stripped:
+                                                wav_end = raw.find(b"data")
+                                                if wav_end != -1:
+                                                    raw = raw[wav_end + 8:]
+                                                    wav_stripped = True
+                                                else:
+                                                    continue
+                                            await sq.put(raw)
+                                    break
+                            except aiohttp.ClientError as e:
+                                if attempt < 2:
+                                    logger.warning(f"TTS connection error (attempt {attempt+1}): {e}")
+                                    await asyncio.sleep(2 ** attempt)
+                                else:
+                                    logger.error(f"TTS connection failed after retries: {e}")
                     except asyncio.CancelledError:
                         raise
                     except Exception as e:
@@ -520,7 +534,12 @@ async def process_audio(audio_buffer: bytes, websocket: WebSocket, session_state
                     finally:
                         await sq.put(None)  # sentinel: sentence done
 
-                asyncio.create_task(_stream_sentence())
+                # Voxtral: single RunPod worker — serialize calls to avoid 502 overload.
+                # Higgs: streaming parallel is fine.
+                if TTS_BACKEND == "voxtral":
+                    await _stream_sentence()
+                else:
+                    asyncio.create_task(_stream_sentence())
         finally:
             await chunk_queue.put(None)  # sentinel: all sentences done
 
