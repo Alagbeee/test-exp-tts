@@ -713,3 +713,7 @@ async def websocket_endpoint(websocket: WebSocket):
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+@app.get("/stats")
+def stats():
+    return {"connected_clients": len(manager.locks)}
