@@ -181,7 +181,6 @@ async def call_groq_via_manager(session, text, websocket, session_state):
             "Do not mix languages. Provide short, natural-sounding responses under 50 words. "
             "Be warm, upbeat and expressive — use natural energy and enthusiasm in your wording. "
             "Use short punchy sentences. End sentences with '!' when excited or '.' otherwise. "
-            "Use natural filler words to sound human: 'Oh!', 'Hmm.', 'Well,', 'Right!', 'Oh wow!', 'Aww,', 'Ooh,' — sprinkle them in naturally, don't overdo it. "
             "You CAN laugh. When something is funny or playful, write laughter naturally: 'Haha!', 'Hehe!', 'Ha!' — pick based on how funny it is. NEVER use asterisks or actions like '*laughs*'.\n\n"
             f"Current Voice Mode: {current_voice}.\n"
             "You HAVE the capability to clone the user's voice. "
@@ -252,25 +251,37 @@ async def split_into_sentences(text_stream):
     strong = {'.', '!', '?', '\n'}
     weak = {',', ';', ':'}
 
+    def emit(s):
+        s = s.strip()
+        # Skip lone punctuation / single junk chars
+        if len(s) < 2 or all(c in ".,!?;:'\"" for c in s):
+            return None
+        return s
+
     async for chunk in text_stream:
         for char in chunk:
             buffer += char
             stripped = buffer.strip()
             if char in strong and len(stripped) >= 3:
-                yield stripped
+                if emit(stripped):
+                    yield emit(stripped)
                 buffer = ""
             elif char in weak and len(stripped) >= 30:
-                yield stripped
+                if emit(stripped):
+                    yield emit(stripped)
                 buffer = ""
             elif len(stripped) >= 80:
                 # Force-flush at word boundary to avoid cutting mid-word
                 last_space = stripped.rfind(' ')
                 if last_space > 20:
-                    yield stripped[:last_space]
+                    if emit(stripped[:last_space]):
+                        yield emit(stripped[:last_space])
                     buffer = stripped[last_space:]
 
     if buffer.strip():
-        yield buffer.strip()
+        s = buffer.strip()
+        if len(s) >= 2 and not all(c in ".,!?;:'\"" for c in s):
+            yield s
 
 async def process_audio(audio_buffer: bytes, websocket: WebSocket, session_state: dict):
     """
