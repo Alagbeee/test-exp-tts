@@ -478,6 +478,57 @@ async def process_audio(audio_buffer: bytes, websocket: WebSocket, session_state
     async def producer():
         """For each LLM sentence, open TTS stream and push a per-sentence byte queue."""
         nonlocal full_response
+
+        async def _tts_call(text_batch, sq):
+            """Send a single TTS call (possibly multi-sentence) and push PCM to sq."""
+            try:
+                wav_stripped = TTS_BACKEND != "voxtral"
+                for attempt in range(3):
+                    try:
+                        async with session.post(
+                            tts_url(), json=build_tts_payload(text_batch),
+                            headers=_runpod_headers(),
+                            timeout=aiohttp.ClientTimeout(total=90)
+                        ) as resp:
+                            if resp.status == 502 and attempt < 2:
+                                logger.warning(f"TTS 502 (attempt {attempt+1}), retrying: {text_batch[:40]}")
+                                await asyncio.sleep(2 ** attempt)
+                                continue
+                            if resp.status != 200:
+                                body = await resp.text()
+                                logger.error(f"TTS {resp.status} for: {text_batch[:40]} | body: {body[:300]}")
+                            else:
+                                async for raw in resp.content.iter_any():
+                                    if not raw:
+                                        continue
+                                    if not wav_stripped:
+                                        wav_end = raw.find(b"data")
+                                        if wav_end != -1:
+                                            raw = raw[wav_end + 8:]
+                                            wav_stripped = True
+                                        else:
+                                            continue
+                                    await sq.put(raw)
+                            break
+                    except aiohttp.ClientError as e:
+                        if attempt < 2:
+                            logger.warning(f"TTS connection error (attempt {attempt+1}): {e}")
+                            await asyncio.sleep(2 ** attempt)
+                        else:
+                            logger.error(f"TTS connection failed after retries: {e}")
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.error(f"TTS stream error: {e}")
+            finally:
+                await sq.put(None)  # sentinel: batch done
+
+        # For Voxtral: send the first sentence immediately for fast first-audio,
+        # then batch subsequent sentences (~200 chars max) to reduce round-trips.
+        VOXTRAL_BATCH_CHARS = 200
+        pending_batch = []
+        first_sent = True
+
         try:
             async for sentence in split_into_sentences(
                 call_groq_via_manager(session, text, websocket, session_state)
@@ -486,60 +537,36 @@ async def process_audio(audio_buffer: bytes, websocket: WebSocket, session_state
                 logger.info(f"Sentence → TTS: {sentence}")
                 await safe_send_text(websocket, {"state": "thinking", "text": full_response.strip()})
 
-                # Each sentence gets its own byte queue; producer fills it, consumer drains it.
-                sent_q: asyncio.Queue = asyncio.Queue()
-                await chunk_queue.put(sent_q)  # tell consumer a new sentence is coming
-
-                async def _stream_sentence(s=sentence, sq=sent_q):
-                    try:
-                        wav_stripped = TTS_BACKEND != "voxtral"
-                        for attempt in range(3):
-                            try:
-                                async with session.post(
-                                    tts_url(), json=build_tts_payload(s),
-                                    headers=_runpod_headers(),
-                                    timeout=aiohttp.ClientTimeout(total=90)
-                                ) as resp:
-                                    if resp.status == 502 and attempt < 2:
-                                        body = await resp.text()
-                                        logger.warning(f"TTS 502 (attempt {attempt+1}), retrying: {s[:30]}")
-                                        await asyncio.sleep(2 ** attempt)
-                                        continue
-                                    if resp.status != 200:
-                                        body = await resp.text()
-                                        logger.error(f"TTS {resp.status} for: {s[:30]} | body: {body[:300]}")
-                                    else:
-                                        async for raw in resp.content.iter_any():
-                                            if not raw:
-                                                continue
-                                            if not wav_stripped:
-                                                wav_end = raw.find(b"data")
-                                                if wav_end != -1:
-                                                    raw = raw[wav_end + 8:]
-                                                    wav_stripped = True
-                                                else:
-                                                    continue
-                                            await sq.put(raw)
-                                    break
-                            except aiohttp.ClientError as e:
-                                if attempt < 2:
-                                    logger.warning(f"TTS connection error (attempt {attempt+1}): {e}")
-                                    await asyncio.sleep(2 ** attempt)
-                                else:
-                                    logger.error(f"TTS connection failed after retries: {e}")
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception as e:
-                        logger.error(f"TTS stream error: {e}")
-                    finally:
-                        await sq.put(None)  # sentinel: sentence done
-
-                # Voxtral: single RunPod worker — serialize calls to avoid 502 overload.
-                # Higgs: streaming parallel is fine.
                 if TTS_BACKEND == "voxtral":
-                    await _stream_sentence()
+                    if first_sent:
+                        # Send first sentence immediately for lowest latency
+                        first_sent = False
+                        sq = asyncio.Queue()
+                        await chunk_queue.put(sq)
+                        logger.info(f"TTS batch (first): {sentence}")
+                        await _tts_call(sentence, sq)
+                    else:
+                        pending_batch.append(sentence)
+                        batch_text = " ".join(pending_batch)
+                        if len(batch_text) >= VOXTRAL_BATCH_CHARS:
+                            sq = asyncio.Queue()
+                            await chunk_queue.put(sq)
+                            logger.info(f"TTS batch ({len(pending_batch)} sents, {len(batch_text)} chars): {batch_text[:60]}")
+                            await _tts_call(batch_text, sq)
+                            pending_batch = []
                 else:
-                    asyncio.create_task(_stream_sentence())
+                    # Higgs: parallel streaming per sentence
+                    sq = asyncio.Queue()
+                    await chunk_queue.put(sq)
+                    asyncio.create_task(_tts_call(sentence, sq))
+
+            # Flush remaining Voxtral batch
+            if TTS_BACKEND == "voxtral" and pending_batch:
+                batch_text = " ".join(pending_batch)
+                sq = asyncio.Queue()
+                await chunk_queue.put(sq)
+                logger.info(f"TTS batch (final, {len(pending_batch)} sents, {len(batch_text)} chars): {batch_text[:60]}")
+                await _tts_call(batch_text, sq)
         finally:
             await chunk_queue.put(None)  # sentinel: all sentences done
 
