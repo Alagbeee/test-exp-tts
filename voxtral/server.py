@@ -130,7 +130,6 @@ def health():
 class GenerateRequest(BaseModel):
     text: str
     voice: str = DEFAULT_VOICE
-    ref_audio: str | None = None  # base64-encoded WAV for voice cloning/accent
 
 
 @app.post("/generate_stream")
@@ -153,7 +152,7 @@ def generate_stream(req: GenerateRequest):
         # Tokenize the speech request
         instruct_tokenizer = _tokenizer.instruct_tokenizer
         tokenized = instruct_tokenizer.encode_speech_request(
-            SpeechRequest(input=req.text, voice=req.voice, ref_audio=req.ref_audio)
+            SpeechRequest(input=req.text, voice=req.voice)
         )
 
         inputs = {
@@ -178,9 +177,8 @@ def generate_stream(req: GenerateRequest):
             buf.seek(0)
 
             dur = len(audio_array) / SAMPLE_RATE
-            mode = "ref_audio_clone" if req.ref_audio else req.voice
             print(f"TTS: {dur:.2f}s audio in {elapsed:.2f}s "
-                  f"(RTF={dur/elapsed:.2f}) voice={mode}", flush=True)
+                  f"(RTF={dur/elapsed:.2f}) voice={req.voice}", flush=True)
 
             return Response(content=buf.read(), media_type="audio/wav")
 

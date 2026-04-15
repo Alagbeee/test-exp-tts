@@ -47,19 +47,6 @@ VOXTRAL_URL = os.environ.get("VOXTRAL_URL", "http://127.0.0.1:8002/generate_stre
 # TTS_BACKEND: "higgs" (raw int16 PCM @ 24kHz) or "voxtral" (WAV @ 24kHz)
 TTS_BACKEND = os.environ.get("TTS_BACKEND", "higgs").lower()
 
-# Optional ref audio for Voxtral voice cloning (e.g. a Dutch native voice sample).
-# Set VOXTRAL_REF_AUDIO_PATH=/path/to/sample.wav — loaded once at startup.
-# When set, the ref audio overrides the VOXTRAL_VOICE preset for accent/timbre.
-_VOXTRAL_REF_AUDIO_B64: str | None = None
-_ref_audio_path = os.environ.get("VOXTRAL_REF_AUDIO_PATH", "")
-if _ref_audio_path:
-    try:
-        with open(_ref_audio_path, "rb") as _f:
-            _VOXTRAL_REF_AUDIO_B64 = base64.b64encode(_f.read()).decode("utf-8")
-        logger.info(f"Loaded Voxtral ref audio from: {_ref_audio_path}")
-    except Exception as _e:
-        logger.warning(f"Could not load VOXTRAL_REF_AUDIO_PATH={_ref_audio_path}: {_e}")
-
 def tts_url() -> str:
     return VOXTRAL_URL if TTS_BACKEND == "voxtral" else HIGGS_URL
 
@@ -442,11 +429,7 @@ async def process_audio(audio_buffer: bytes, websocket: WebSocket, session_state
     def build_tts_payload(sentence: str) -> dict:
         payload = {"text": sentence}
         if TTS_BACKEND == "voxtral":
-            if _VOXTRAL_REF_AUDIO_B64:
-                # Reference audio overrides voice preset — gives native accent (e.g. Dutch)
-                payload["ref_audio"] = _VOXTRAL_REF_AUDIO_B64
-            else:
-                payload["voice"] = os.environ.get("VOXTRAL_VOICE", "casual_male")
+            payload["voice"] = os.environ.get("VOXTRAL_VOICE", "casual_male")
         elif session_state.get("voice_mode") == "user" and session_state.get("best_user_audio"):
             try:
                 with open(session_state["best_user_audio"], "rb") as af:
