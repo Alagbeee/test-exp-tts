@@ -445,8 +445,6 @@ async def process_audio(audio_buffer: bytes, websocket: WebSocket, session_state
     # Using a queue of futures that resolve to async iterators.
     chunk_queue: asyncio.Queue = asyncio.Queue()  # items: asyncio.Queue[bytes] | None sentinel
     full_response = ""
-    _bg_tasks: list = []  # track Higgs asyncio.create_task handles for cancellation
-    _cancelled = [False]  # mutable flag: set True on cancel so late-completing tasks drop their audio
 
     async def producer():
         """For each LLM sentence, open TTS stream and push a per-sentence byte queue."""
@@ -481,7 +479,7 @@ async def process_audio(audio_buffer: bytes, websocket: WebSocket, session_state
                                     # Voxtral: buffer entire WAV, strip header, normalize
                                     pcm_buf = bytearray()
                                     async for raw in resp.content.iter_any():
-                                        if not raw or _cancelled[0]:
+                                        if not raw:
                                             continue
                                         total_bytes += len(raw)
                                         if not wav_stripped:
@@ -492,7 +490,7 @@ async def process_audio(audio_buffer: bytes, websocket: WebSocket, session_state
                                             else:
                                                 continue
                                         pcm_buf.extend(raw)
-                                    if pcm_buf and not _cancelled[0]:
+                                    if pcm_buf:
                                         import numpy as np
                                         samples = np.frombuffer(pcm_buf, dtype=np.int16).astype(np.float32)
                                         peak = np.abs(samples).max()
@@ -508,8 +506,6 @@ async def process_audio(audio_buffer: bytes, websocket: WebSocket, session_state
                                     async for raw in resp.content.iter_any():
                                         if not raw:
                                             continue
-                                        if _cancelled[0]:
-                                            break
                                         total_bytes += len(raw)
                                         streamed += len(raw)
                                         await sq.put(raw)
@@ -560,11 +556,10 @@ async def process_audio(audio_buffer: bytes, websocket: WebSocket, session_state
                             await _tts_call(batch_text, sq)
                             pending_batch = []
                 else:
-                    # Higgs: parallel streaming per sentence
+                    # Higgs: serialize calls — stream PCM chunks as they arrive
                     sq = asyncio.Queue()
                     await chunk_queue.put(sq)
-                    t = asyncio.create_task(_tts_call(sentence, sq))
-                    _bg_tasks.append(t)
+                    await _tts_call(sentence, sq)
 
             # Flush remaining Voxtral batch
             if TTS_BACKEND == "voxtral" and pending_batch:
@@ -574,11 +569,6 @@ async def process_audio(audio_buffer: bytes, websocket: WebSocket, session_state
                 logger.info(f"TTS batch (final, {len(pending_batch)} sents, {len(batch_text)} chars): {batch_text[:60]}")
                 await _tts_call(batch_text, sq)
         except asyncio.CancelledError:
-            # Mark cancelled so any still-running bg tasks don't inject stale audio
-            _cancelled[0] = True
-            for t in _bg_tasks:
-                if not t.done():
-                    t.cancel()
             raise
         finally:
             await chunk_queue.put(None)  # sentinel: all sentences done
@@ -597,18 +587,14 @@ async def process_audio(audio_buffer: bytes, websocket: WebSocket, session_state
                 raw = await sent_q.get()
                 if raw is None:
                     break  # sentence done
-                if session_state.get("stop_sending"):
-                    continue  # drain queue but don't send — interrupted
                 total_pcm += len(raw)
                 residual.extend(raw)
                 while len(residual) >= TTS_CHUNK_SIZE:
-                    if session_state.get("stop_sending"):
-                        break
                     await safe_send_bytes(websocket, bytes(residual[:TTS_CHUNK_SIZE]))
                     del residual[:TTS_CHUNK_SIZE]
                     chunks_sent += 1
         # Flush any partial tail chunk
-        if residual and not session_state.get("stop_sending"):
+        if residual:
             await safe_send_bytes(websocket, bytes(residual))
             chunks_sent += 1
         logger.info(f"Consumer done: {total_pcm} PCM bytes, {chunks_sent} chunks sent to websocket")
@@ -618,7 +604,6 @@ async def process_audio(audio_buffer: bytes, websocket: WebSocket, session_state
         await safe_send_text(websocket, {"state": "idle", "message": "Listening..."})
 
     except asyncio.CancelledError:
-        _cancelled[0] = True  # ensure flag is set even if producer already exited normally
         logger.info("Process audio task cancelled (interrupted by user)")
         raise
     except Exception as e:
@@ -642,7 +627,6 @@ async def websocket_endpoint(websocket: WebSocket):
     session_state = {
         "voice_mode": "system",   # 'system' or 'user'
         "last_user_audio": None,
-        "stop_sending": False,    # set True on interrupt to immediately halt consumer output
     }
     
     try:
@@ -691,13 +675,12 @@ async def websocket_endpoint(websocket: WebSocket):
                     if speech_frames >= VAD_MIN_SPEECH_FRAMES:
                         is_speaking = True
                         logger.info("Speech detected")
-                        # Interruption: stop consumer output immediately, then cancel task
+                        # Interruption: cancel task — all TTS calls are serialized,
+                        # so cancel cleanly stops the one active call
                         if current_task and not current_task.done():
-                            session_state["stop_sending"] = True
                             current_task.cancel()
                             logger.info("Interrupted current task")
                             await safe_send_text(websocket, {"state": "interrupted"})
-                            session_state["stop_sending"] = False
                         
                         await safe_send_text(websocket, {"state": "listening", "message": "Listening..."})
                 
