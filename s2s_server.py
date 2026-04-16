@@ -445,6 +445,7 @@ async def process_audio(audio_buffer: bytes, websocket: WebSocket, session_state
     # Using a queue of futures that resolve to async iterators.
     chunk_queue: asyncio.Queue = asyncio.Queue()  # items: asyncio.Queue[bytes] | None sentinel
     full_response = ""
+    _bg_tasks: list = []  # track Higgs asyncio.create_task handles for cancellation
 
     async def producer():
         """For each LLM sentence, open TTS stream and push a per-sentence byte queue."""
@@ -544,7 +545,8 @@ async def process_audio(audio_buffer: bytes, websocket: WebSocket, session_state
                     # Higgs: parallel streaming per sentence
                     sq = asyncio.Queue()
                     await chunk_queue.put(sq)
-                    asyncio.create_task(_tts_call(sentence, sq))
+                    t = asyncio.create_task(_tts_call(sentence, sq))
+                    _bg_tasks.append(t)
 
             # Flush remaining Voxtral batch
             if TTS_BACKEND == "voxtral" and pending_batch:
@@ -553,6 +555,12 @@ async def process_audio(audio_buffer: bytes, websocket: WebSocket, session_state
                 await chunk_queue.put(sq)
                 logger.info(f"TTS batch (final, {len(pending_batch)} sents, {len(batch_text)} chars): {batch_text[:60]}")
                 await _tts_call(batch_text, sq)
+        except asyncio.CancelledError:
+            # Cancel any orphan Higgs background TTS tasks so they don't tie up the worker
+            for t in _bg_tasks:
+                if not t.done():
+                    t.cancel()
+            raise
         finally:
             await chunk_queue.put(None)  # sentinel: all sentences done
 
@@ -570,14 +578,18 @@ async def process_audio(audio_buffer: bytes, websocket: WebSocket, session_state
                 raw = await sent_q.get()
                 if raw is None:
                     break  # sentence done
+                if session_state.get("stop_sending"):
+                    continue  # drain queue but don't send — interrupted
                 total_pcm += len(raw)
                 residual.extend(raw)
                 while len(residual) >= TTS_CHUNK_SIZE:
+                    if session_state.get("stop_sending"):
+                        break
                     await safe_send_bytes(websocket, bytes(residual[:TTS_CHUNK_SIZE]))
                     del residual[:TTS_CHUNK_SIZE]
                     chunks_sent += 1
         # Flush any partial tail chunk
-        if residual:
+        if residual and not session_state.get("stop_sending"):
             await safe_send_bytes(websocket, bytes(residual))
             chunks_sent += 1
         logger.info(f"Consumer done: {total_pcm} PCM bytes, {chunks_sent} chunks sent to websocket")
@@ -609,7 +621,8 @@ async def websocket_endpoint(websocket: WebSocket):
     # Session state for voice cloning
     session_state = {
         "voice_mode": "system",   # 'system' or 'user'
-        "last_user_audio": None
+        "last_user_audio": None,
+        "stop_sending": False,    # set True on interrupt to immediately halt consumer output
     }
     
     try:
@@ -658,11 +671,13 @@ async def websocket_endpoint(websocket: WebSocket):
                     if speech_frames >= VAD_MIN_SPEECH_FRAMES:
                         is_speaking = True
                         logger.info("Speech detected")
-                        # Interruption: Cancel existing task and notify client
+                        # Interruption: stop consumer output immediately, then cancel task
                         if current_task and not current_task.done():
+                            session_state["stop_sending"] = True
                             current_task.cancel()
                             logger.info("Interrupted current task")
                             await safe_send_text(websocket, {"state": "interrupted"})
+                            session_state["stop_sending"] = False
                         
                         await safe_send_text(websocket, {"state": "listening", "message": "Listening..."})
                 
