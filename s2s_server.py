@@ -68,8 +68,8 @@ def _runpod_headers() -> dict:
 
 
 SAMPLE_RATE = 16000
-VAD_THRESHOLD = 800  # Lowered: capture quiet/distant mic input
-SILENCE_DURATION = 0.6  # Slightly longer to avoid cutting off
+VAD_THRESHOLD = 1800 # Adjusted sensitivity based on user feedback
+SILENCE_DURATION = 0.5  # Faster turn-taking
 MIN_AUDIO_DURATION = 0.5 # Minimum audio duration to process
 # Require consecutive high-energy frames before declaring speech to avoid
 # accidental self-interrupts from playback leakage/echo.
@@ -453,9 +453,14 @@ async def process_audio(audio_buffer: bytes, websocket: WebSocket, session_state
         nonlocal full_response
 
         async def _tts_call(text_batch, sq):
-            """Send a single TTS call (possibly multi-sentence) and push PCM to sq."""
+            """Send a single TTS call (possibly multi-sentence) and push PCM to sq.
+            
+            Higgs: streams raw int16 PCM — forward each chunk immediately.
+            Voxtral: returns WAV — buffer, strip header, normalize, then push.
+            """
             try:
-                wav_stripped = TTS_BACKEND != "voxtral"
+                is_voxtral = TTS_BACKEND == "voxtral"
+                wav_stripped = not is_voxtral  # Higgs: already raw PCM
                 for attempt in range(3):
                     try:
                         async with session.post(
@@ -472,31 +477,43 @@ async def process_audio(audio_buffer: bytes, websocket: WebSocket, session_state
                                 logger.error(f"TTS {resp.status} for: {text_batch[:40]} | body: {body[:300]}")
                             else:
                                 total_bytes = 0
-                                pcm_buf = bytearray()
-                                async for raw in resp.content.iter_any():
-                                    if not raw:
-                                        continue
-                                    total_bytes += len(raw)
-                                    if not wav_stripped:
-                                        wav_end = raw.find(b"data")
-                                        if wav_end != -1:
-                                            raw = raw[wav_end + 8:]
-                                            wav_stripped = True
-                                        else:
+                                if is_voxtral:
+                                    # Voxtral: buffer entire WAV, strip header, normalize
+                                    pcm_buf = bytearray()
+                                    async for raw in resp.content.iter_any():
+                                        if not raw or _cancelled[0]:
                                             continue
-                                    pcm_buf.extend(raw)
-                                # Normalize volume to consistent peak level
-                                if pcm_buf and not _cancelled[0]:
-                                    import numpy as np
-                                    samples = np.frombuffer(pcm_buf, dtype=np.int16).astype(np.float32)
-                                    peak = np.abs(samples).max()
-                                    if peak > 0:
-                                        target = 28000.0  # ~85% of int16 max (32767)
-                                        samples = np.clip(samples * (target / peak), -32768, 32767)
-                                        pcm_buf = samples.astype(np.int16).tobytes()
-                                    pcm_bytes = len(pcm_buf)
-                                    await sq.put(bytes(pcm_buf))
-                                logger.info(f"TTS response: {total_bytes} total bytes, {len(pcm_buf)} PCM bytes for: {text_batch[:40]}")
+                                        total_bytes += len(raw)
+                                        if not wav_stripped:
+                                            wav_end = raw.find(b"data")
+                                            if wav_end != -1:
+                                                raw = raw[wav_end + 8:]
+                                                wav_stripped = True
+                                            else:
+                                                continue
+                                        pcm_buf.extend(raw)
+                                    if pcm_buf and not _cancelled[0]:
+                                        import numpy as np
+                                        samples = np.frombuffer(pcm_buf, dtype=np.int16).astype(np.float32)
+                                        peak = np.abs(samples).max()
+                                        if peak > 0:
+                                            target = 28000.0
+                                            samples = np.clip(samples * (target / peak), -32768, 32767)
+                                            pcm_buf = samples.astype(np.int16).tobytes()
+                                        await sq.put(bytes(pcm_buf))
+                                    logger.info(f"TTS response: {total_bytes} total, {len(pcm_buf)} PCM for: {text_batch[:40]}")
+                                else:
+                                    # Higgs: stream raw PCM chunks directly for lowest latency
+                                    streamed = 0
+                                    async for raw in resp.content.iter_any():
+                                        if not raw:
+                                            continue
+                                        if _cancelled[0]:
+                                            break
+                                        total_bytes += len(raw)
+                                        streamed += len(raw)
+                                        await sq.put(raw)
+                                    logger.info(f"TTS streamed: {total_bytes} total, {streamed} PCM for: {text_batch[:40]}")
                             break
                     except aiohttp.ClientError as e:
                         if attempt < 2:
