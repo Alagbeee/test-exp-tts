@@ -639,6 +639,7 @@ async def websocket_endpoint(websocket: WebSocket):
     silence_start = None
     is_speaking = False
     current_task = None
+    current_task_start = None  # time when current_task was created
     leftover = bytearray()  # leftover bytes not yet forming a full VAD frame
     tts_playing = False  # True while TTS audio is being sent to client
     
@@ -703,11 +704,22 @@ async def websocket_endpoint(websocket: WebSocket):
                     # Speech detected
                     if not is_speaking:
                         is_speaking = True
-                        logger.info(f"Speech detected (WebRTC VAD, count={speech_count}, tts={tts_active})")
+                        task_age = (time.time() - current_task_start) if current_task_start else 999
+                        logger.info(f"Speech detected (WebRTC VAD, count={speech_count}, tts={tts_active}, task_age={task_age:.1f}s)")
+                        # Only interrupt if task has been running long enough (TTS has likely started)
+                        # or if TTS is actively playing (user deliberately interrupting)
                         if current_task and not current_task.done():
-                            current_task.cancel()
-                            logger.info("Interrupted current task")
-                            await safe_send_text(websocket, {"state": "interrupted"})
+                            if tts_active or task_age >= 3.0:
+                                current_task.cancel()
+                                current_task_start = None
+                                logger.info("Interrupted current task")
+                                await safe_send_text(websocket, {"state": "interrupted"})
+                            else:
+                                logger.info(f"Suppressing interrupt (task too young: {task_age:.1f}s < 3s)")
+                                is_speaking = False  # don't accumulate audio yet
+                                ring = [False] * VAD_RING_SIZE
+                                ring_idx = 0
+                                continue
                         await safe_send_text(websocket, {"state": "listening", "message": "Listening..."})
                     
                     silence_start = None
@@ -734,6 +746,7 @@ async def websocket_endpoint(websocket: WebSocket):
                                 current_task = asyncio.create_task(
                                     process_audio(current_buffer, websocket, session_state)
                                 )
+                                current_task_start = time.time()
                             
                             silence_start = None
                             # Reset ring to avoid re-triggering on stale frames
