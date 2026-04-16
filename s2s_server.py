@@ -68,8 +68,8 @@ def _runpod_headers() -> dict:
 
 
 SAMPLE_RATE = 16000
-VAD_THRESHOLD = 1800 # Adjusted sensitivity based on user feedback
-SILENCE_DURATION = 0.5  # Faster turn-taking
+VAD_THRESHOLD = 800  # Lowered: capture quiet/distant mic input
+SILENCE_DURATION = 0.6  # Slightly longer to avoid cutting off
 MIN_AUDIO_DURATION = 0.5 # Minimum audio duration to process
 # Require consecutive high-energy frames before declaring speech to avoid
 # accidental self-interrupts from playback leakage/echo.
