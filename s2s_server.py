@@ -446,6 +446,7 @@ async def process_audio(audio_buffer: bytes, websocket: WebSocket, session_state
     chunk_queue: asyncio.Queue = asyncio.Queue()  # items: asyncio.Queue[bytes] | None sentinel
     full_response = ""
     _bg_tasks: list = []  # track Higgs asyncio.create_task handles for cancellation
+    _cancelled = [False]  # mutable flag: set True on cancel so late-completing tasks drop their audio
 
     async def producer():
         """For each LLM sentence, open TTS stream and push a per-sentence byte queue."""
@@ -485,7 +486,7 @@ async def process_audio(audio_buffer: bytes, websocket: WebSocket, session_state
                                             continue
                                     pcm_buf.extend(raw)
                                 # Normalize volume to consistent peak level
-                                if pcm_buf:
+                                if pcm_buf and not _cancelled[0]:
                                     import numpy as np
                                     samples = np.frombuffer(pcm_buf, dtype=np.int16).astype(np.float32)
                                     peak = np.abs(samples).max()
@@ -495,7 +496,7 @@ async def process_audio(audio_buffer: bytes, websocket: WebSocket, session_state
                                         pcm_buf = samples.astype(np.int16).tobytes()
                                     pcm_bytes = len(pcm_buf)
                                     await sq.put(bytes(pcm_buf))
-                                logger.info(f"TTS response: {total_bytes} total bytes, {pcm_bytes} PCM bytes for: {text_batch[:40]}")
+                                logger.info(f"TTS response: {total_bytes} total bytes, {len(pcm_buf)} PCM bytes for: {text_batch[:40]}")
                             break
                     except aiohttp.ClientError as e:
                         if attempt < 2:
@@ -556,7 +557,8 @@ async def process_audio(audio_buffer: bytes, websocket: WebSocket, session_state
                 logger.info(f"TTS batch (final, {len(pending_batch)} sents, {len(batch_text)} chars): {batch_text[:60]}")
                 await _tts_call(batch_text, sq)
         except asyncio.CancelledError:
-            # Cancel any orphan Higgs background TTS tasks so they don't tie up the worker
+            # Mark cancelled so any still-running bg tasks don't inject stale audio
+            _cancelled[0] = True
             for t in _bg_tasks:
                 if not t.done():
                     t.cancel()
@@ -599,6 +601,7 @@ async def process_audio(audio_buffer: bytes, websocket: WebSocket, session_state
         await safe_send_text(websocket, {"state": "idle", "message": "Listening..."})
 
     except asyncio.CancelledError:
+        _cancelled[0] = True  # ensure flag is set even if producer already exited normally
         logger.info("Process audio task cancelled (interrupted by user)")
         raise
     except Exception as e:
