@@ -10,6 +10,7 @@ import base64
 from pathlib import Path
 import aiohttp
 import numpy as np
+import webrtcvad
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.websockets import WebSocketState
@@ -68,12 +69,20 @@ def _runpod_headers() -> dict:
 
 
 SAMPLE_RATE = 16000
-VAD_THRESHOLD = 1800 # Adjusted sensitivity based on user feedback
-SILENCE_DURATION = 0.5  # Faster turn-taking
-MIN_AUDIO_DURATION = 0.5 # Minimum audio duration to process
-# Require consecutive high-energy frames before declaring speech to avoid
-# accidental self-interrupts from playback leakage/echo.
-VAD_MIN_SPEECH_FRAMES = 2
+
+# WebRTC VAD config
+# Aggressiveness: 0 (least) to 3 (most aggressive at filtering non-speech)
+VAD_AGGRESSIVENESS = 3
+# Frame size: WebRTC VAD requires 10/20/30ms frames. 30ms = 960 bytes @ 16kHz int16
+VAD_FRAME_MS = 30
+VAD_FRAME_BYTES = SAMPLE_RATE * 2 * VAD_FRAME_MS // 1000  # 960 bytes
+# Speech/silence thresholds (number of 30ms frames)
+# Need 3+ speech frames out of last 8 to trigger speech start (~90ms min)
+VAD_SPEECH_FRAMES_THRESHOLD = 3
+VAD_RING_SIZE = 8
+# Silence duration after last speech frame to trigger processing
+SILENCE_DURATION = 0.5
+MIN_AUDIO_DURATION = 0.5
 
 # TTS output normalization: emit fixed-size chunks for smooth playback
 # 4800 bytes = 2400 samples @ 24kHz int16 mono = 100ms per chunk
@@ -620,18 +629,23 @@ async def websocket_endpoint(websocket: WebSocket):
     audio_buffer = bytearray()
     silence_start = None
     is_speaking = False
-    speech_frames = 0
     current_task = None
+    leftover = bytearray()  # leftover bytes not yet forming a full VAD frame
+    
+    # WebRTC VAD instance (per-connection)
+    vad = webrtcvad.Vad(VAD_AGGRESSIVENESS)
+    # Rolling ring buffer of recent frame results (True=speech, False=silence)
+    ring = [False] * VAD_RING_SIZE
+    ring_idx = 0
     
     # Session state for voice cloning
     session_state = {
-        "voice_mode": "system",   # 'system' or 'user'
+        "voice_mode": "system",
         "last_user_audio": None,
     }
     
     try:
         while True:
-            # We use receive() instead of receive_bytes() to handle text (heartbeats) too
             try:
                 message = await websocket.receive()
             except Exception as e:
@@ -644,78 +658,69 @@ async def websocket_endpoint(websocket: WebSocket):
                 try:
                     text_data = json.loads(message["text"])
                     if text_data.get("type") == "ping":
-                        # Heartbeat, ignore
                         continue
                 except:
                     pass
                 continue
             else:
-                # This includes 'websocket.disconnect' types
                 if message.get("type") == "websocket.disconnect":
                     logger.info("WebSocket disconnect message received")
                     break
                 continue
             
-            # Simple VAD (Energy based)
-            # 16-bit PCM, 16kHz
-            chunk_np = np.frombuffer(data, dtype=np.int16)
-            if len(chunk_np) == 0:
-                continue
+            # Accumulate bytes and process in 30ms frames for WebRTC VAD
+            leftover.extend(data)
+            
+            while len(leftover) >= VAD_FRAME_BYTES:
+                frame = bytes(leftover[:VAD_FRAME_BYTES])
+                del leftover[:VAD_FRAME_BYTES]
                 
-            # Calculate RMS amplitude
-            energy = np.sqrt(np.mean(chunk_np.astype(float)**2))
-            
-            # Diagnostic: occasionally log energy for calibration (e.g. every 100 frames or if > 1000)
-            if energy > 1000:
-                logger.debug(f"Audio energy: {energy:.1f}")
-            
-            if energy > VAD_THRESHOLD:
-                speech_frames += 1
-                if not is_speaking:
-                    if speech_frames >= VAD_MIN_SPEECH_FRAMES:
+                # Run WebRTC VAD on this 30ms frame
+                try:
+                    is_speech = vad.is_speech(frame, SAMPLE_RATE)
+                except Exception:
+                    is_speech = False
+                
+                ring[ring_idx] = is_speech
+                ring_idx = (ring_idx + 1) % VAD_RING_SIZE
+                speech_count = sum(ring)
+                
+                if speech_count >= VAD_SPEECH_FRAMES_THRESHOLD:
+                    # Speech detected
+                    if not is_speaking:
                         is_speaking = True
-                        logger.info("Speech detected")
-                        # Interruption: cancel task — all TTS calls are serialized,
-                        # so cancel cleanly stops the one active call
+                        logger.info("Speech detected (WebRTC VAD)")
                         if current_task and not current_task.done():
                             current_task.cancel()
                             logger.info("Interrupted current task")
                             await safe_send_text(websocket, {"state": "interrupted"})
-                        
                         await safe_send_text(websocket, {"state": "listening", "message": "Listening..."})
-                
-                # Reset silence timer
-                silence_start = None
-                if is_speaking:
-                    audio_buffer.extend(data)
-                
-            else:
-                speech_frames = 0
-                # Silence frame
-                if is_speaking:
-                    # Append silence if we are in "speaking" mode to catch trailing words
-                    audio_buffer.extend(data)
                     
-                    if silence_start is None:
-                        silence_start = time.time()
-                    else:
-                        if time.time() - silence_start > SILENCE_DURATION:
-                            # Silence confirmed, process buffer
+                    silence_start = None
+                    audio_buffer.extend(frame)
+                    
+                else:
+                    # Non-speech frame
+                    if is_speaking:
+                        audio_buffer.extend(frame)
+                        
+                        if silence_start is None:
+                            silence_start = time.time()
+                        elif time.time() - silence_start > SILENCE_DURATION:
                             is_speaking = False
                             logger.info("Silence detected, processing buffer")
                             
                             if len(audio_buffer) > 0:
                                 current_buffer = bytes(audio_buffer)
                                 audio_buffer = bytearray()
-                                
-                                # Start as background task
-                                # Note: We don't wait for it here
-                                current_task = asyncio.create_task(process_audio(current_buffer, websocket, session_state))
+                                current_task = asyncio.create_task(
+                                    process_audio(current_buffer, websocket, session_state)
+                                )
                             
                             silence_start = None
-                else:
-                    # Just silence, do nothing
-                    pass
+                            # Reset ring to avoid re-triggering on stale frames
+                            ring = [False] * VAD_RING_SIZE
+                            ring_idx = 0
 
     except WebSocketDisconnect:
         logger.info("Client disconnected naturally")
