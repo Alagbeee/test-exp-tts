@@ -641,7 +641,6 @@ async def websocket_endpoint(websocket: WebSocket):
     current_task = None
     current_task_start = None  # time when current_task was created
     leftover = bytearray()  # leftover bytes not yet forming a full VAD frame
-    tts_playing = False  # True while TTS audio is being sent to client
     
     # WebRTC VAD instance (per-connection)
     vad = webrtcvad.Vad(VAD_AGGRESSIVENESS)
@@ -686,6 +685,17 @@ async def websocket_endpoint(websocket: WebSocket):
                 frame = bytes(leftover[:VAD_FRAME_BYTES])
                 del leftover[:VAD_FRAME_BYTES]
                 
+                # While TTS is playing: hard-suppress all VAD, discard audio entirely.
+                # This prevents ambient noise / speaker echo from interrupting the assistant.
+                if session_state.get("tts_playing", False):
+                    # Keep ring clear so there's no stale speech history when TTS ends
+                    ring = [False] * VAD_RING_SIZE
+                    ring_idx = 0
+                    audio_buffer = bytearray()
+                    is_speaking = False
+                    silence_start = None
+                    continue
+                
                 # Run WebRTC VAD on this 30ms frame
                 try:
                     is_speech = vad.is_speech(frame, SAMPLE_RATE)
@@ -696,27 +706,21 @@ async def websocket_endpoint(websocket: WebSocket):
                 ring_idx = (ring_idx + 1) % VAD_RING_SIZE
                 speech_count = sum(ring)
                 
-                # During TTS playback, use higher threshold to ignore echo
-                tts_active = session_state.get("tts_playing", False)
-                threshold = 7 if tts_active else VAD_SPEECH_FRAMES_THRESHOLD
-                
-                if speech_count >= threshold:
+                if speech_count >= VAD_SPEECH_FRAMES_THRESHOLD:
                     # Speech detected
                     if not is_speaking:
                         is_speaking = True
                         task_age = (time.time() - current_task_start) if current_task_start else 999
-                        logger.info(f"Speech detected (WebRTC VAD, count={speech_count}, tts={tts_active}, task_age={task_age:.1f}s)")
-                        # Only interrupt if task has been running long enough (TTS has likely started)
-                        # or if TTS is actively playing (user deliberately interrupting)
+                        logger.info(f"Speech detected (WebRTC VAD, count={speech_count}, task_age={task_age:.1f}s)")
                         if current_task and not current_task.done():
-                            if tts_active or task_age >= 3.0:
+                            if task_age >= 3.0:
                                 current_task.cancel()
                                 current_task_start = None
                                 logger.info("Interrupted current task")
                                 await safe_send_text(websocket, {"state": "interrupted"})
                             else:
                                 logger.info(f"Suppressing interrupt (task too young: {task_age:.1f}s < 3s)")
-                                is_speaking = False  # don't accumulate audio yet
+                                is_speaking = False
                                 ring = [False] * VAD_RING_SIZE
                                 ring_idx = 0
                                 continue
@@ -726,11 +730,6 @@ async def websocket_endpoint(websocket: WebSocket):
                     audio_buffer.extend(frame)
                     
                 else:
-                    # Non-speech frame (or echo suppressed)
-                    if tts_active and not is_speaking:
-                        # During TTS playback, don't accumulate echo audio
-                        continue
-                    
                     if is_speaking:
                         audio_buffer.extend(frame)
                         
