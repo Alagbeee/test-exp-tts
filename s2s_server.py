@@ -587,26 +587,35 @@ async def process_audio(audio_buffer: bytes, websocket: WebSocket, session_state
         residual = bytearray()
         chunks_sent = 0
         total_pcm = 0
-        while True:
-            sent_q = await chunk_queue.get()
-            if sent_q is None:
-                break  # all done
-            # Drain this sentence's byte stream
+        session_state["tts_playing"] = True
+        try:
             while True:
-                raw = await sent_q.get()
-                if raw is None:
-                    break  # sentence done
-                total_pcm += len(raw)
-                residual.extend(raw)
-                while len(residual) >= TTS_CHUNK_SIZE:
-                    await safe_send_bytes(websocket, bytes(residual[:TTS_CHUNK_SIZE]))
-                    del residual[:TTS_CHUNK_SIZE]
-                    chunks_sent += 1
-        # Flush any partial tail chunk
-        if residual:
-            await safe_send_bytes(websocket, bytes(residual))
-            chunks_sent += 1
-        logger.info(f"Consumer done: {total_pcm} PCM bytes, {chunks_sent} chunks sent to websocket")
+                sent_q = await chunk_queue.get()
+                if sent_q is None:
+                    break  # all done
+                # Drain this sentence's byte stream
+                while True:
+                    raw = await sent_q.get()
+                    if raw is None:
+                        break  # sentence done
+                    total_pcm += len(raw)
+                    residual.extend(raw)
+                    while len(residual) >= TTS_CHUNK_SIZE:
+                        await safe_send_bytes(websocket, bytes(residual[:TTS_CHUNK_SIZE]))
+                        del residual[:TTS_CHUNK_SIZE]
+                        chunks_sent += 1
+            # Flush any partial tail chunk
+            if residual:
+                await safe_send_bytes(websocket, bytes(residual))
+                chunks_sent += 1
+            logger.info(f"Consumer done: {total_pcm} PCM bytes, {chunks_sent} chunks sent to websocket")
+        finally:
+            # Grace period: keep tts_playing True briefly so VAD ignores echo tail
+            try:
+                await asyncio.sleep(0.4)
+            except asyncio.CancelledError:
+                pass
+            session_state["tts_playing"] = False
 
     try:
         await asyncio.gather(producer(), consumer())
@@ -631,6 +640,7 @@ async def websocket_endpoint(websocket: WebSocket):
     is_speaking = False
     current_task = None
     leftover = bytearray()  # leftover bytes not yet forming a full VAD frame
+    tts_playing = False  # True while TTS audio is being sent to client
     
     # WebRTC VAD instance (per-connection)
     vad = webrtcvad.Vad(VAD_AGGRESSIVENESS)
@@ -685,11 +695,15 @@ async def websocket_endpoint(websocket: WebSocket):
                 ring_idx = (ring_idx + 1) % VAD_RING_SIZE
                 speech_count = sum(ring)
                 
-                if speech_count >= VAD_SPEECH_FRAMES_THRESHOLD:
+                # During TTS playback, use higher threshold to ignore echo
+                tts_active = session_state.get("tts_playing", False)
+                threshold = 7 if tts_active else VAD_SPEECH_FRAMES_THRESHOLD
+                
+                if speech_count >= threshold:
                     # Speech detected
                     if not is_speaking:
                         is_speaking = True
-                        logger.info("Speech detected (WebRTC VAD)")
+                        logger.info(f"Speech detected (WebRTC VAD, count={speech_count}, tts={tts_active})")
                         if current_task and not current_task.done():
                             current_task.cancel()
                             logger.info("Interrupted current task")
@@ -700,7 +714,11 @@ async def websocket_endpoint(websocket: WebSocket):
                     audio_buffer.extend(frame)
                     
                 else:
-                    # Non-speech frame
+                    # Non-speech frame (or echo suppressed)
+                    if tts_active and not is_speaking:
+                        # During TTS playback, don't accumulate echo audio
+                        continue
+                    
                     if is_speaking:
                         audio_buffer.extend(frame)
                         
